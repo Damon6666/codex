@@ -53,6 +53,8 @@ pub use codex_thread::ThreadConfigSnapshot;
 pub use session::turn_context::TurnContext;
 pub use thread_startup_metadata::ThreadStartupMetadata;
 mod agent;
+mod pulsing;
+pub use pulsing::run_e2e as run_pulsing_e2e;
 pub use agent::api::AgentConfigUpdate;
 pub use agent::api::AgentControl;
 pub use agent::api::AgentInfo;

@@ -8,6 +8,10 @@ version.workspace = true
 name = "codex_core"
 path = "src/lib.rs"
 
+[[bin]]
+name = "codex-pulsing-e2e"
+path = "src/bin/pulsing_e2e.rs"
+
 [lints]
 workspace = true
 
@@ -94,6 +98,7 @@ image = { workspace = true, features = ["jpeg", "png", "webp"] }
 indexmap = { workspace = true }
 libc = { workspace = true }
 once_cell = { workspace = true }
+pulsing-actor = { path = "../../../Pulsing/crates/pulsing-actor", default-features = false }
 rand = { workspace = true }
 regex-lite = { workspace = true }
 rmcp = { workspace = true, default-features = false, features = [
@@ -115,6 +120,7 @@ tokio = { workspace = true, features = [
     "process",
     "rt-multi-thread",
     "signal",
+    "time",
 ] }
 tokio-util = { workspace = true, features = ["rt"] }
 tokio-tungstenite = { workspace = true }

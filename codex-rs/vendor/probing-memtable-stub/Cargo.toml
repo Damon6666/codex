@@ -1,0 +1,6 @@
+[package]
+name = "probing-memtable"
+version = "0.2.5"
+edition = "2021"
+description = "Windows-safe no-op stub for pulsing-actor"
+publish = false
