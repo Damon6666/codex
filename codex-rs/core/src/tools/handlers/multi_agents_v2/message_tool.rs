@@ -50,7 +50,19 @@ pub(super) async fn handle_message_string_tool(
         source,
         ..
     } = invocation;
-    let receiver_thread_id = resolve_agent_target(&session, &turn, &target).await?;
+    let receiver_thread_id = match resolve_agent_target(&session, &turn, &target).await {
+        Ok(thread_id) => thread_id,
+        Err(err) => {
+            if crate::pulsing::enabled() {
+                return crate::pulsing::send_remote(&session, &turn, &target, &message, mode)
+                    .await
+                    .map_err(|remote| {
+                        FunctionCallError::RespondToModel(format!("{err}; pulsing: {remote}"))
+                    });
+            }
+            return Err(err);
+        }
+    };
     analytics.set_receiver(receiver_thread_id);
     let receiver_agent_path = session
         .services

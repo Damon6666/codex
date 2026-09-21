@@ -1,0 +1,20 @@
+[package]
+name = "codex-pulsing-demo"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal Codex-shaped shop: keep in-process mail, send ⑤ out via Pulsing"
+publish = false
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+pulsing-actor = { path = "../../Pulsing/crates/pulsing-actor", default-features = false }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+# probing-memtable 0.2.5 uses Unix shm; native Windows cannot compile it.
+[patch.crates-io]
+probing-memtable = { path = "stub-probing-memtable" }
+
+[profile.dev]
+incremental = true
