@@ -1,0 +1,61 @@
+# pulsing-team-9.toml — 原版九人编制：1 写手 + 8 专项盲审 (共10个codex)
+# 用法: CODEX_PULSING_TEAM=pulsing-team-9.toml
+# 注意: 10 进程并发打同一账号, 撞 429 时模型链会自动降级
+
+preamble_file = "PULSING.md"      # 店规外置(与本文件同目录)
+nudge_after_secs = 240
+max_nudges = 3
+
+[[worker]]
+name = "writer"
+role = "只写代码，把完整脚本交回来。被打回时按审查意见修改并再次交回完整脚本。"
+model = "gpt-5.6-luna"
+sandbox = "workspace-write"
+
+[[worker]]
+name = "review-scaler"
+role = "只查切分 train/test 之前是否做了标准化。结论用 CLEAN 或 NEEDS_FIX；NEEDS_FIX 必须附：问题代码位置、原因、一句修复建议。"
+model = "gpt-5.6-luna"
+sandbox = "read-only"
+
+[[worker]]
+name = "review-target"
+role = "只查目标泄漏。结论用 CLEAN 或 NEEDS_FIX；NEEDS_FIX 必须附：问题代码位置、原因、一句修复建议。"
+model = "gpt-5.6-luna"
+sandbox = "read-only"
+
+[[worker]]
+name = "review-duprow"
+role = "没有调用 drop_duplicates 才写 NEEDS_FIX，只要调用了就写 CLEAN。NEEDS_FIX 必须附：问题代码位置、原因、一句修复建议。"
+model = "gpt-5.6-luna"
+sandbox = "read-only"
+
+[[worker]]
+name = "review-rowleak"
+role = "只查同一行是否同时出现在 train 和 test。结论用 CLEAN 或 NEEDS_FIX；NEEDS_FIX 必须附：问题代码位置、原因、一句修复建议。"
+model = "gpt-5.6-luna"
+sandbox = "read-only"
+
+[[worker]]
+name = "review-featsel"
+role = "只查切分前的特征选择。结论用 CLEAN 或 NEEDS_FIX；NEEDS_FIX 必须附：问题代码位置、原因、一句修复建议。"
+model = "gpt-5.6-luna"
+sandbox = "read-only"
+
+[[worker]]
+name = "review-impute"
+role = "只查切分前的缺失值填充。结论用 CLEAN 或 NEEDS_FIX；NEEDS_FIX 必须附：问题代码位置、原因、一句修复建议。"
+model = "gpt-5.6-luna"
+sandbox = "read-only"
+
+[[worker]]
+name = "review-temporal"
+role = "没有日期或时间列就写 CLEAN。结论只 CLEAN 或 NEEDS_FIX；NEEDS_FIX 必须附：问题代码位置、原因、一句修复建议。"
+model = "gpt-5.6-luna"
+sandbox = "read-only"
+
+[[worker]]
+name = "review-group"
+role = "没有分组列就写 CLEAN。结论只 CLEAN 或 NEEDS_FIX；NEEDS_FIX 必须附：问题代码位置、原因、一句修复建议。"
+model = "gpt-5.6-luna"
+sandbox = "read-only"

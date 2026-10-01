@@ -451,26 +451,46 @@ impl Session {
         self: &Arc<Self>,
         sub_id: String,
     ) {
+        let trace = std::env::var("CODEX_PULSING_TRACE").is_ok();
         if !self.input_queue.has_pending_mailbox_items().await
             || (!self.input_queue.has_trigger_turn_mailbox_items().await
                 && !self.has_outstanding_durable_sleep())
         {
+            if trace {
+                eprintln!("TRACE[wake] return: no pending trigger mail");
+            }
             return;
         }
 
         let turn_state = {
             let mut active_turn = self.active_turn.lock().await;
             if active_turn.is_some() {
+                if trace {
+                    let has_task = active_turn.as_ref().is_some_and(|t| t.task.is_some());
+                    eprintln!("TRACE[wake] return: active_turn occupied (task_running={has_task})");
+                }
                 return;
             }
             let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
             Arc::clone(&active_turn.turn_state)
         };
 
-        self.services
-            .models_manager
-            .refresh_after_auth_change(self.get_config().await.http_client_factory())
-            .await;
+        // The refresh is best-effort catalog caching; a slow endpoint must not
+        // block wake-ups behind the serial op loop, or queued mail looks
+        // "lost" to senders for the whole refresh duration.
+        if tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.services.models_manager.refresh_after_auth_change(
+                self.get_config().await.http_client_factory(),
+            ),
+        )
+        .await
+        .is_err()
+        {
+            if trace {
+                eprintln!("TRACE[wake] model refresh timed out, proceeding anyway");
+            }
+        }
         // A completion-triggered wakeup can be interrupted while discovery waits.
         if self
             .active_turn
@@ -479,6 +499,9 @@ impl Session {
             .as_ref()
             .is_none_or(|turn| !Arc::ptr_eq(&turn.turn_state, &turn_state))
         {
+            if trace {
+                eprintln!("TRACE[wake] return: turn state changed during refresh");
+            }
             return;
         }
         let (input, mut start_options) =
@@ -865,6 +888,9 @@ impl Session {
             warn!("failed to flush rollout after emitting terminal turn event: {err}");
         }
         if cleared_active_turn {
+            if std::env::var("CODEX_PULSING_TRACE").is_ok() {
+                eprintln!("TRACE[wake] turn finished, re-arming pending work");
+            }
             self.maybe_start_turn_for_pending_work().await;
         }
     }

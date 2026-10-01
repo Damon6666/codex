@@ -10,7 +10,7 @@ anyhow = "1"
 async-trait = "0.1"
 pulsing-actor = { path = "../../Pulsing/crates/pulsing-actor", default-features = false }
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "process", "io-util"] }
 
 # probing-memtable 0.2.5 uses Unix shm; native Windows cannot compile it.
 [patch.crates-io]

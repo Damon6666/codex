@@ -1192,7 +1192,6 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, registry: &mut Tool
     {
         registry.add(SleepHandler);
     }
-
     if tool_suggest_enabled(turn_context)
         && let Some(candidates) = context
             .tool_suggest_candidates

@@ -3327,7 +3327,7 @@ impl Config {
             web_search_request: override_tools_web_search_request,
         };
 
-        let configured_features = Features::from_sources(
+        let mut configured_features = Features::from_sources(
             FeatureConfigSource {
                 features: cfg.features.as_ref(),
                 experimental_use_unified_exec_tool: cfg.experimental_use_unified_exec_tool,
@@ -3337,6 +3337,10 @@ impl Config {
             },
             feature_overrides,
         );
+        // Pulsing mail uses the v2 followup_task tool. The feature is off by default.
+        if crate::pulsing::enabled() {
+            configured_features.enable(Feature::MultiAgentV2);
+        }
         let features = ManagedFeatures::from_configured_with_warnings(
             configured_features,
             feature_requirements,
@@ -3711,7 +3715,12 @@ impl Config {
                 .unwrap_or_default(),
         };
         let code_mode = resolve_code_mode_config(&cfg);
-        let multi_agent_v2 = resolve_multi_agent_v2_config(&cfg);
+        let mut multi_agent_v2 = resolve_multi_agent_v2_config(&cfg);
+        // Remote shops answer in a later turn. The local wait_agent tool only
+        // watches in-process children, so it stalls the mesh turn.
+        if crate::pulsing::enabled() {
+            multi_agent_v2.wait_agent_enabled = false;
+        }
         let token_budget = resolve_token_budget_config(&cfg, &features)?;
         let rollout_budget = resolve_rollout_budget_config(&cfg, &features)?;
         let current_time_reminder = resolve_current_time_reminder_config(&cfg, &features)?;

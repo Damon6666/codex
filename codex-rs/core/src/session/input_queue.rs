@@ -313,6 +313,9 @@ impl InputQueue {
             return (pending_input, TurnStartOptions::default());
         }
         let (mailbox_items, start_options) = self.drain_mailbox_input_items().await;
+        if std::env::var("CODEX_PULSING_TRACE").is_ok() && !mailbox_items.is_empty() {
+            eprintln!("TRACE[mail] drained {} mailbox item(s)", mailbox_items.len());
+        }
         if pending_input.is_empty() {
             (mailbox_items, start_options)
         } else {

@@ -40,6 +40,7 @@ pub(super) async fn handle_message_string_tool(
     mode: MessageDeliveryMode,
     target: String,
     message: String,
+    shutdown: bool,
     analytics: &mut ToolCallAnalytics,
 ) -> Result<FunctionToolOutput, FunctionCallError> {
     let message = message_content(message)?;
@@ -54,8 +55,18 @@ pub(super) async fn handle_message_string_tool(
         Ok(thread_id) => thread_id,
         Err(err) => {
             if crate::pulsing::enabled() {
-                return crate::pulsing::send_remote(&session, &turn, &target, &message, mode)
-                    .await
+                let encrypted =
+                    !matches!(source, crate::tools::context::ToolCallSource::DirectPlaintextMessage);
+                return crate::pulsing::send_remote(
+                    &session,
+                    &turn,
+                    &target,
+                    &message,
+                    mode,
+                    encrypted,
+                    shutdown,
+                )
+                .await
                     .map_err(|remote| {
                         FunctionCallError::RespondToModel(format!("{err}; pulsing: {remote}"))
                     });

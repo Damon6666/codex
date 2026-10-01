@@ -11,6 +11,13 @@ pub(crate) struct InterAgentWire {
     pub to_shop: String,
     pub body: String,
     pub trigger_turn: bool,
+    /// `followup_task` message text is an API-encrypted argument. The receiver
+    /// must hand it back as encrypted content so the API can decrypt it.
+    #[serde(default)]
+    pub encrypted: bool,
+    /// Ask this process to leave the mesh. No model turn is started.
+    #[serde(default)]
+    pub shutdown: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -32,8 +39,13 @@ impl Actor for CodexPeer {
     ) -> pulsing_actor::error::Result<Message> {
         let wire: InterAgentWire = msg.unpack()?;
         crate::pulsing::record_inbound(&wire);
+        if wire.shutdown {
+            crate::pulsing::schedule_shutdown(&wire.from_shop);
+            return Message::pack(&DeliverAck { ok: true });
+        }
         if let Err(err) = inject_local(&self.control, self.root, &wire).await {
-            tracing::warn!(?err, "pulsing inbound inject failed (wire still received)");
+            tracing::warn!(?err, "pulsing inbound inject failed");
+            return Message::pack(&DeliverAck { ok: false });
         }
         Message::pack(&DeliverAck { ok: true })
     }

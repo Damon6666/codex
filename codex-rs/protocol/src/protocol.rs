@@ -884,22 +884,28 @@ impl InterAgentCommunication {
     pub fn to_model_input_item(&self) -> ResponseItem {
         let content = match &self.encrypted_content {
             Some(encrypted_content) => {
-                let message_type = if self.trigger_turn {
-                    "NEW_TASK"
-                } else {
-                    "MESSAGE"
-                };
-                vec![
-                    AgentMessageInputContent::InputText {
+                let mut items = Vec::new();
+                if self.content.is_empty() {
+                    let message_type = if self.trigger_turn {
+                        "NEW_TASK"
+                    } else {
+                        "MESSAGE"
+                    };
+                    items.push(AgentMessageInputContent::InputText {
                         text: format!(
                             "Message Type: {message_type}\nTask name: {}\nSender: {}\nPayload:\n",
                             self.recipient, self.author
                         ),
-                    },
-                    AgentMessageInputContent::EncryptedContent {
-                        encrypted_content: encrypted_content.clone(),
-                    },
-                ]
+                    });
+                } else {
+                    items.push(AgentMessageInputContent::InputText {
+                        text: self.content.clone(),
+                    });
+                }
+                items.push(AgentMessageInputContent::EncryptedContent {
+                    encrypted_content: encrypted_content.clone(),
+                });
+                items
             }
             None => vec![AgentMessageInputContent::InputText {
                 text: self.content.clone(),

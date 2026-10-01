@@ -1035,6 +1035,16 @@ fn restore_terminal_before_fatal_exit() {
     startup_recovery::print_unsent_draft();
 }
 
+fn pulsing_env_on(name: &str) -> bool {
+    matches!(
+        std::env::var(name)
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 pub async fn run_main(
     cli: Cli,
     arg0_paths: Arg0DispatchPaths,
@@ -1100,6 +1110,19 @@ async fn run_ratatui_app(
     let uses_remote_workspace = app_server_target.uses_remote_workspace();
     let workload_identity_selected = is_workload_identity_selected();
     color_eyre::install()?;
+    // Child shop: `codex "角色说明"` joins the mesh and waits. The sentence is
+    // the role, not a turn to run before any mail arrives.
+    if pulsing_env_on("CODEX_PULSING")
+        && std::env::var("CODEX_PULSING_SEEDS")
+            .ok()
+            .is_some_and(|seeds| !seeds.trim().is_empty())
+        && let Some(role) = cli.prompt.clone()
+        && !role.trim().is_empty()
+    {
+        // SAFETY: process is still single-threaded during startup; role is read later by inject.
+        unsafe { std::env::set_var("CODEX_PULSING_ROLE", role) };
+        cli.prompt = None;
+    }
 
     tooltips::announcement::prewarm(initial_config.http_client_factory());
 

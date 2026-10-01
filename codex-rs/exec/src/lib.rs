@@ -182,6 +182,8 @@ enum InitialOperation {
     Review {
         review_request: ReviewRequest,
     },
+    /// Mesh peer: session stays up and answers Pulsing mail. No initial user turn.
+    PulsingWait,
 }
 
 enum StdinPromptBehavior {
@@ -937,6 +939,19 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                 (InitialOperation::ForkOnly, String::new())
             }
         }
+        (None, Some(role), imgs) if pulsing_child() => {
+            if !imgs.is_empty() {
+                anyhow::bail!("a pulsing child shop does not take images");
+            }
+            unsafe { std::env::set_var("CODEX_PULSING_ROLE", role) };
+            (InitialOperation::PulsingWait, "pulsing-wait".to_string())
+        }
+        (None, None, imgs) if pulsing_env_flag("CODEX_PULSING") && imgs.is_empty() => {
+            (InitialOperation::PulsingWait, "pulsing-wait".to_string())
+        }
+        (None, _, _) if pulsing_env_wait() => {
+            (InitialOperation::PulsingWait, "pulsing-wait".to_string())
+        }
         (None, root_prompt, imgs) => {
             let prompt_text = resolve_root_prompt(root_prompt);
             let mut items: Vec<UserInput> = imgs
@@ -1118,7 +1133,15 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         }
     });
 
-    let task_id = match initial_operation {
+    let pulsing_wait = pulsing_env_flag("CODEX_PULSING");
+    let mut task_id = match initial_operation {
+        InitialOperation::PulsingWait => {
+            let shop = std::env::var("CODEX_PULSING_NAME").unwrap_or_else(|_| "codex".into());
+            let listen =
+                std::env::var("CODEX_PULSING_LISTEN").unwrap_or_else(|_| "127.0.0.1:8101".into());
+            eprintln!("PULSING_WAIT shop={shop} listen={listen}");
+            String::new()
+        }
         InitialOperation::ForkOnly => {
             request_shutdown(&client, &mut request_ids, &primary_thread_id_for_span)
                 .await
@@ -1134,6 +1157,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             items,
             output_schema,
         } => {
+            wait_pulsing_ready().await?;
             let response: TurnStartResponse = send_request_with_response(
                 &client,
                 ClientRequest::TurnStart {
@@ -1207,13 +1231,24 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     // exit with a non-zero status for automation-friendly signaling.
     let mut error_seen = false;
     let mut interrupt_channel_open = true;
+    let mut mesh_told_user = false;
+    let mut mesh_mailed = false;
+    let mut mesh_reply = String::new();
+    let mut mesh_quiet_at: Option<tokio::time::Instant> = None;
+    let mut ever_mailed = false;
     let primary_thread_id_for_requests = primary_thread_id.to_string();
     loop {
+        let quiet_at = mesh_quiet_at;
         let server_event = tokio::select! {
+            biased;
             maybe_interrupt = interrupt_rx.recv(), if interrupt_channel_open => {
                 if maybe_interrupt.is_none() {
                     interrupt_channel_open = false;
                     continue;
+                }
+                if pulsing_wait {
+                    eprintln!("pulsing: 收到 Ctrl-C，结束并关掉后台 Codex。");
+                    break;
                 }
                 if let Err(err) = send_request_with_response::<TurnInterruptResponse>(
                     &client,
@@ -1233,6 +1268,18 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                 continue;
             }
             maybe_event = client.next_event() => maybe_event,
+            _ = async {
+                if task_id.is_empty()
+                    && let Some(at) = quiet_at
+                {
+                    tokio::time::sleep_until(at).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                eprintln!("pulsing: 结果已交给用户，结束并关掉后台 Codex。");
+                break;
+            }
         };
 
         let Some(server_event) = server_event else {
@@ -1245,6 +1292,14 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             }
             InProcessServerEvent::ServerNotification(notification) => {
                 let mut notification = *notification;
+                if pulsing_wait
+                    && task_id.is_empty()
+                    && let ServerNotification::TurnStarted(started) = &notification
+                    && started.thread_id == primary_thread_id_for_requests
+                {
+                    task_id = started.turn.id.clone();
+                    codex_core::note_judge_busy(true);
+                }
                 if let ServerNotification::Error(payload) = &notification {
                     if payload.thread_id == primary_thread_id_for_requests
                         && payload.turn_id == task_id
@@ -1264,6 +1319,12 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                     error_seen = true;
                 }
 
+                note_mesh_turn(
+                    &notification,
+                    &mut mesh_told_user,
+                    &mut mesh_mailed,
+                    &mut mesh_reply,
+                );
                 if should_process_notification(
                     &notification,
                     &primary_thread_id_for_requests,
@@ -1280,16 +1341,116 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                     match event_processor.process_server_notification(notification) {
                         CodexStatus::Running => {}
                         CodexStatus::InitiateShutdown => {
-                            if let Err(err) = request_shutdown(
-                                &client,
-                                &mut request_ids,
-                                &primary_thread_id_for_requests,
-                            )
-                            .await
-                            {
-                                warn!("thread/unsubscribe failed during shutdown: {err}");
+                            codex_core::note_judge_busy(false);
+                            let mailed_remote = codex_core::take_turn_mailed();
+                            if mailed_remote {
+                                ever_mailed = true;
                             }
-                            break;
+                            let sent_to = codex_core::take_last_sent_to();
+                            let reply_to = codex_core::last_inbound_from();
+                            let mailed_assigner = mailed_remote
+                                && reply_to
+                                    .as_ref()
+                                    .is_some_and(|from| sent_to.as_deref() == Some(from.as_str()));
+                            let mesh_finished = pulsing_wait
+                                && !pulsing_child()
+                                && mesh_told_user
+                                && !mesh_mailed
+                                && !mailed_remote
+                                && codex_core::pending_reply_count() == 0;
+                            eprintln!(
+                                "pulsing: exit gate told_user={mesh_told_user} mailed={mesh_mailed} \
+                                 remote={mailed_remote} pending={} outstanding={}",
+                                codex_core::pending_reply_count(),
+                                codex_core::mesh_outstanding()
+                            );
+                            if pulsing_child() && !mailed_assigner && codex_core::last_inbound_from().is_some()
+                            {
+                                let reply = if mesh_reply.trim().is_empty() {
+                                    "这一轮没有产出。".to_string()
+                                } else {
+                                    mesh_reply.clone()
+                                };
+                                match codex_core::forward_unsent_reply(&reply).await {
+                                    Ok(()) => eprintln!(
+                                        "pulsing: 本轮没有把结果寄回来信的店，已补寄。"
+                                    ),
+                                    Err(err) => {
+                                        eprintln!("pulsing: 未能把结果寄回: {err}");
+                                    }
+                                }
+                            }
+                            if pulsing_wait && !mesh_finished {
+                                // First-turn failure fast exit: the model errored before
+                                // any mail was sent and nothing was told to the user, so
+                                // listening can never recover (no pending mail to nudge).
+                                // Exit non-zero so an outer model-chain retry can take over.
+                                if !pulsing_child()
+                                    && error_seen
+                                    && !mesh_told_user
+                                    && !ever_mailed
+                                    && codex_core::pending_reply_count() == 0
+                                {
+                                    eprintln!(
+                                        "pulsing: 首轮即失败(模型错误,可能满载), 结束监听; 请换模型重跑。"
+                                    );
+                                    codex_core::kill_peer_children();
+                                    let _ = request_shutdown(
+                                        &client,
+                                        &mut request_ids,
+                                        &primary_thread_id_for_requests,
+                                    )
+                                    .await;
+                                    break;
+                                }
+                                if !pulsing_child() && codex_core::pending_reply_count() > 0 {
+                                    mesh_quiet_at = None;
+                                } else if !pulsing_child() {
+                                    // Nothing owed and nothing incoming can start a new
+                                    // turn on its own, so arm the quiet exit regardless
+                                    // of whether this particular turn told the user.
+                                    mesh_quiet_at = Some(
+                                        tokio::time::Instant::now()
+                                            + tokio::time::Duration::from_secs(60),
+                                    );
+                                }
+                                if !pulsing_child()
+                                    && codex_core::pending_reply_count() == 0
+                                    && mesh_quiet_at.is_some_and(|at| tokio::time::Instant::now() >= at)
+                                {
+                                    eprintln!("pulsing: 结果已交给用户，结束并关掉后台 Codex。");
+                                    if let Err(err) = request_shutdown(
+                                        &client,
+                                        &mut request_ids,
+                                        &primary_thread_id_for_requests,
+                                    )
+                                    .await
+                                    {
+                                        warn!("thread/unsubscribe failed during shutdown: {err}");
+                                    }
+                                    break;
+                                }
+                                eprintln!("PULSING_WAIT turn done, still listening");
+                                task_id.clear();
+                                error_seen = false;
+                                mesh_told_user = false;
+                                mesh_mailed = false;
+                                mesh_reply.clear();
+                            } else {
+                                if mesh_finished {
+                                    eprintln!("pulsing: 结果已交给用户，结束并关掉后台 Codex。");
+                                }
+                                if let Err(err) = request_shutdown(
+                                    &client,
+                                    &mut request_ids,
+                                    &primary_thread_id_for_requests,
+                                )
+                                .await
+                                {
+                                    warn!("thread/unsubscribe failed during shutdown: {err}");
+                                }
+                                break;
+                            }
                         }
                     }
                 }
@@ -1302,8 +1463,10 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         }
     }
 
-    if let Err(err) = client.shutdown().await {
-        warn!("in-process app-server shutdown failed: {err}");
+    match tokio::time::timeout(std::time::Duration::from_secs(3), client.shutdown()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => warn!("in-process app-server shutdown failed: {err}"),
+        Err(_) => warn!("in-process app-server shutdown timed out"),
     }
     event_processor.print_final_output();
     if error_seen {
@@ -2270,6 +2433,92 @@ fn prompt_with_stdin_context(prompt: &str, stdin_text: &str) -> String {
     }
     combined.push_str("</stdin>");
     combined
+}
+
+fn note_mesh_turn(
+    notification: &ServerNotification,
+    told_user: &mut bool,
+    mailed: &mut bool,
+    reply: &mut String,
+) {
+    let item = match notification {
+        ServerNotification::ItemCompleted(completed) => &completed.item,
+        ServerNotification::ItemStarted(started) => &started.item,
+        _ => return,
+    };
+    match item {
+        AppServerThreadItem::AgentMessage { text, .. } if !text.trim().is_empty() => {
+            *told_user = true;
+            reply.clear();
+            reply.push_str(text);
+        }
+        AppServerThreadItem::CollabAgentToolCall { tool, .. }
+            if matches!(tool, codex_app_server_protocol::CollabAgentTool::FollowupTask) =>
+        {
+            *mailed = true;
+        }
+        _ => {}
+    }
+}
+
+fn pulsing_env_flag(name: &str) -> bool {
+    matches!(
+        std::env::var(name)
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Child shops set both. The process joins the mesh and does not exit after a turn.
+fn pulsing_env_wait() -> bool {
+    pulsing_env_flag("CODEX_PULSING") && pulsing_env_flag("CODEX_PULSING_WAIT")
+}
+
+fn pulsing_child() -> bool {
+    pulsing_env_flag("CODEX_PULSING")
+        && std::env::var("CODEX_PULSING_SEEDS")
+            .ok()
+            .is_some_and(|seeds| !seeds.trim().is_empty())
+}
+
+/// Judge sets `CODEX_PULSING_READY` to peer `host:port` values. The quoted task
+/// stays on the command line, and the model turn starts after those ports listen.
+async fn wait_pulsing_ready() -> anyhow::Result<()> {
+    if !pulsing_env_flag("CODEX_PULSING") {
+        return Ok(());
+    }
+    let raw = std::env::var("CODEX_PULSING_READY").unwrap_or_default();
+    let addrs: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|addr| !addr.is_empty())
+        .map(str::to_string)
+        .collect();
+    if addrs.is_empty() {
+        return Ok(());
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    eprintln!("PULSING_READY waiting for {}", addrs.join(","));
+    for addr in &addrs {
+        let sock: std::net::SocketAddr = addr
+            .parse()
+            .map_err(|err| anyhow::anyhow!("CODEX_PULSING_READY has bad address {addr}: {err}"))?;
+        loop {
+            if std::net::TcpStream::connect_timeout(&sock, std::time::Duration::from_secs(1))
+                .is_ok()
+            {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("PULSING_READY timed out waiting for {addr}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+    eprintln!("PULSING_READY peers are listening");
+    Ok(())
 }
 
 fn resolve_prompt(prompt_arg: Option<String>) -> String {
