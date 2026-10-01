@@ -1298,6 +1298,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                     && started.thread_id == primary_thread_id_for_requests
                 {
                     task_id = started.turn.id.clone();
+                    codex_core::note_judge_busy(true);
                 }
                 if let ServerNotification::Error(payload) = &notification {
                     if payload.thread_id == primary_thread_id_for_requests
@@ -1340,6 +1341,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                     match event_processor.process_server_notification(notification) {
                         CodexStatus::Running => {}
                         CodexStatus::InitiateShutdown => {
+                            codex_core::note_judge_busy(false);
                             let mailed_remote = codex_core::take_turn_mailed();
                             if mailed_remote {
                                 ever_mailed = true;

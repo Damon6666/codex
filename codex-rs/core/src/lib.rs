@@ -58,6 +58,7 @@ pub use pulsing::forward_unsent_reply;
 pub use pulsing::kill_peer_children;
 pub use pulsing::last_inbound_from;
 pub use pulsing::mesh_outstanding;
+pub use pulsing::note_judge_busy;
 pub use pulsing::pending_reply_count;
 pub use pulsing::prepare_prompt_peers;
 pub use pulsing::take_last_sent_to;

@@ -199,11 +199,29 @@ struct PendingReply {
 static PENDING_REPLIES: OnceLock<std::sync::Mutex<std::collections::HashMap<String, PendingReply>>> =
     OnceLock::new();
 
+/// Judge turn-state hint for the keepalive: while a turn runs, silence is
+/// expected and no keepalive should fire.
+static JUDGE_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LAST_MAIL_ACTIVITY: OnceLock<std::sync::Mutex<std::time::Instant>> = OnceLock::new();
+
+/// Exec marks judge busy at turn start so the keepalive stays quiet mid-turn.
+pub fn note_judge_busy(busy: bool) {
+    JUDGE_BUSY.store(busy, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn note_mail_activity() {
+    let slot = LAST_MAIL_ACTIVITY.get_or_init(|| std::sync::Mutex::new(std::time::Instant::now()));
+    if let Ok(mut at) = slot.lock() {
+        *at = std::time::Instant::now();
+    }
+}
+
 fn pending_replies() -> &'static std::sync::Mutex<std::collections::HashMap<String, PendingReply>> {
     PENDING_REPLIES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 pub(crate) fn note_reply_pending(shop: &str) {
+    note_mail_activity();
     if let Ok(mut pending) = pending_replies().lock() {
         pending.insert(
             shop.to_string(),
@@ -216,6 +234,7 @@ pub(crate) fn note_reply_pending(shop: &str) {
 }
 
 fn note_reply_arrived(shop: &str) {
+    note_mail_activity();
     if let Ok(mut pending) = pending_replies().lock() {
         pending.remove(shop);
     }
@@ -271,11 +290,35 @@ fn spawn_reply_watchdog(nudge_after_secs: u64, max_nudges: u32) {
             for shop in due {
                 eprintln!("pulsing: nudging {shop} (auto-nudge, limit {max_nudges})");
                 if send_watchdog_nudge(&shop).await.is_ok() {
+                    note_mail_activity();
                     if let Ok(mut pending) = pending_replies().lock() {
                         if let Some(entry) = pending.get_mut(&shop) {
                             entry.nudges += 1;
                             entry.sent_at = std::time::Instant::now();
                         }
+                    }
+                }
+            }
+            // Keepalive: a reply can be enqueued yet fail to wake the session
+            // (lost wake race retires the ledger entry but starts no turn).
+            // While the judge is idle, total mail silence past the nudge
+            // window means nobody will ever act; re-send a self notice so the
+            // wake path is retried (fresh trigger mail has never failed).
+            if !JUDGE_BUSY.load(std::sync::atomic::Ordering::SeqCst) {
+                let silent_too_long = LAST_MAIL_ACTIVITY
+                    .get_or_init(|| std::sync::Mutex::new(std::time::Instant::now()))
+                    .lock()
+                    .map(|at| at.elapsed() >= Duration::from_secs(nudge_after_secs.max(60)))
+                    .unwrap_or(false);
+                if silent_too_long {
+                    eprintln!("pulsing: keepalive self-notice (idle, no mail activity)");
+                    if send_self_notice(
+                        "保活检查：长时间没有邮件往来。若有未处理的回信请继续处理；若各店均已答复请汇总收尾。",
+                    )
+                    .await
+                    .is_ok()
+                    {
+                        note_mail_activity();
                     }
                 }
             }
