@@ -1764,7 +1764,8 @@ impl Session {
                 next_internal_sub_id: AtomicU64::new(0),
             });
             if session_configuration.parent_thread_id.is_none() {
-                crate::pulsing::attach_root(sess.services.agent_control.clone(), thread_id).await;
+                crate::pulsing::attach_root(sess.services.agent_control.clone(), thread_id)
+                .await;
             }
             if let Some(startup) = &startup {
                 let _ = startup.session.set(Arc::clone(&sess));

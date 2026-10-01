@@ -16,6 +16,10 @@ pub struct InterAgentWire {
     pub to_session: String,
     pub body: String,
     pub trigger_turn: bool,
+    #[serde(default)]
+    pub attach_name: Option<String>,
+    #[serde(default)]
+    pub attach_b64: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -30,6 +34,8 @@ pub struct InboxItem {
     pub from_session: String,
     pub body: String,
     pub trigger_turn: bool,
+    pub attach_name: Option<String>,
+    pub attach_bytes: Option<Vec<u8>>,
 }
 
 pub struct Shop {
@@ -85,14 +91,20 @@ impl Shop {
         for (session, items) in &self.inboxes {
             lines.push(format!("  Session {session} 邮箱 {} 封", items.len()));
             for (i, item) in items.iter().enumerate() {
+                let preview: String = item.body.chars().take(80).collect();
+                let attach = match (&item.attach_name, &item.attach_bytes) {
+                    (Some(n), Some(b)) => format!(" attach={n} ({}B)", b.len()),
+                    _ => String::new(),
+                };
                 lines.push(format!(
-                    "    [{}] {}/{} -> {}  trigger={}  「{}」",
+                    "    [{}] {}/{} -> {}  trigger={}  「{}」{}",
                     i,
                     item.from_shop,
                     item.from_session,
                     session,
                     item.trigger_turn,
-                    item.body
+                    preview,
+                    attach
                 ));
             }
         }
@@ -155,13 +167,31 @@ pub async fn deliver_message(
     body: &str,
     trigger_turn: bool,
 ) -> anyhow::Result<String> {
+    deliver_message_ex(shop, system, from_session, target, body, trigger_turn, None).await
+}
+
+pub async fn deliver_message_ex(
+    shop: &Arc<Mutex<Shop>>,
+    system: &Arc<ActorSystem>,
+    from_session: &str,
+    target: &str,
+    body: &str,
+    trigger_turn: bool,
+    attach: Option<(String, Vec<u8>)>,
+) -> anyhow::Result<String> {
     let (shop_name, local) = {
         let s = shop.lock().expect("shop");
         (s.name.clone(), s.is_local_session(target))
     };
+    let (attach_name, attach_bytes, attach_b64) = match attach {
+        Some((name, bytes)) => {
+            let b64 = b64::encode(&bytes);
+            (Some(name), Some(bytes), Some(b64))
+        }
+        None => (None, None, None),
+    };
 
     if local {
-        // ④ memory
         let mut s = shop.lock().expect("shop");
         s.deliver_local(
             target,
@@ -170,13 +200,15 @@ pub async fn deliver_message(
                 from_session: from_session.to_string(),
                 body: body.to_string(),
                 trigger_turn,
+                attach_name,
+                attach_bytes,
             },
         );
         return Ok(format!("④ 内存投递 -> Session {target}"));
     }
 
-    // ⑤ Pulsing. Names must be namespace/name (e.g. shops/codex-a).
     let actor_path = pulsing_path(target);
+    let attach_note = attach_b64.as_ref().map(|s| s.len()).unwrap_or(0);
     let wire = InterAgentWire {
         from_shop: shop_name,
         from_session: from_session.to_string(),
@@ -184,13 +216,70 @@ pub async fn deliver_message(
         to_session: "root".to_string(),
         body: body.to_string(),
         trigger_turn,
+        attach_name,
+        attach_b64,
     };
     let peer = resolve_named(system, &actor_path).await?;
     let ack: DeliverAck = peer.ask(wire).await?;
     Ok(format!(
-        "⑤ Pulsing resolve({actor_path})+ask  ack.ok={} inbox_len={}",
+        "⑤ Pulsing resolve({actor_path})+ask  ack.ok={} inbox_len={} attach_b64={attach_note}",
         ack.ok, ack.inbox_len
     ))
+}
+
+pub mod b64 {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    pub fn encode(data: &[u8]) -> String {
+        let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+        for chunk in data.chunks(3) {
+            let a = chunk[0] as u32;
+            let b = chunk.get(1).copied().unwrap_or(0) as u32;
+            let c = chunk.get(2).copied().unwrap_or(0) as u32;
+            let n = (a << 16) | (b << 8) | c;
+            out.push(T[(n >> 18) as usize] as char);
+            out.push(T[((n >> 12) & 63) as usize] as char);
+            out.push(if chunk.len() > 1 {
+                T[((n >> 6) & 63) as usize] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                T[(n & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
+    pub fn decode(s: &str) -> anyhow::Result<Vec<u8>> {
+        let mut acc = 0u32;
+        let mut bits = 0u32;
+        let mut out = Vec::with_capacity(s.len() * 3 / 4);
+        for c in s.bytes() {
+            if c == b'=' {
+                break;
+            }
+            let v = match c {
+                b'A'..=b'Z' => c - b'A',
+                b'a'..=b'z' => c - b'a' + 26,
+                b'0'..=b'9' => c - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                b'\n' | b'\r' | b' ' => continue,
+                _ => anyhow::bail!("invalid base64 byte {c}"),
+            } as u32;
+            acc = (acc << 6) | v;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((acc >> bits) as u8);
+                acc &= (1 << bits) - 1;
+            }
+        }
+        Ok(out)
+    }
 }
 
 pub fn pulsing_path(shop_name: &str) -> String {
@@ -230,6 +319,16 @@ impl Actor for CodexPeer {
     ) -> pulsing_actor::error::Result<Message> {
         let wire: InterAgentWire = msg.unpack()?;
         let mut shop = self.shop.lock().expect("shop");
+        let attach_bytes = wire
+            .attach_b64
+            .as_deref()
+            .and_then(|raw| match b64::decode(raw) {
+                Ok(bytes) => Some(bytes),
+                Err(err) => {
+                    eprintln!("pulsing attach b64 decode failed: {err:#}");
+                    None
+                }
+            });
         shop.deliver_local(
             &wire.to_session,
             InboxItem {
@@ -237,6 +336,8 @@ impl Actor for CodexPeer {
                 from_session: wire.from_session,
                 body: wire.body,
                 trigger_turn: wire.trigger_turn,
+                attach_name: wire.attach_name,
+                attach_bytes,
             },
         );
         Message::pack(&DeliverAck {

@@ -32,6 +32,7 @@ use codex_rollout_trace::REDUCED_STATE_FILE_NAME;
 use codex_rollout_trace::replay_bundle;
 use codex_state::StateRuntime;
 use codex_tui::AppExitInfo;
+use codex_tui::TokenUsage;
 use codex_tui::Cli as TuiCli;
 use codex_tui::ExitReason;
 use codex_tui::UpdateAction;
@@ -1234,6 +1235,21 @@ async fn cli_main(
 
     let open_agents_overview = matches!(&subcommand, Some(Subcommand::Agents(_)));
     match subcommand {
+        // The quoted string is the whole input. No TUI composer.
+        None if pulsing_cli_on() => {
+            let mut exec_cli =
+                ExecCli::try_parse_from(["codex", "exec", "--skip-git-repo-check"])?;
+            exec_cli
+                .shared
+                .inherit_exec_root_options(&interactive.shared);
+            exec_cli.strict_config |= root_strict_config;
+            prepend_config_flags(
+                &mut exec_cli.config_overrides,
+                root_config_overrides.clone(),
+            );
+            exec_cli.prompt = interactive.prompt.clone();
+            codex_exec::run_main(exec_cli, arg0_paths.clone()).await?;
+        }
         None | Some(Subcommand::Agents(_)) => {
             prepend_config_flags(
                 &mut interactive.config_overrides,
@@ -2815,6 +2831,16 @@ fn read_remote_auth_token_from_env_var(env_var_name: &str) -> anyhow::Result<Str
     read_remote_auth_token_from_env_var_with(env_var_name, |name| std::env::var(name))
 }
 
+fn pulsing_cli_on() -> bool {
+    matches!(
+        std::env::var("CODEX_PULSING")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 async fn run_interactive_tui(
     mut interactive: TuiCli,
     remote: Option<String>,
@@ -2833,9 +2859,47 @@ async fn run_interactive_tui(
             ));
         }
     }
-    if let Some(prompt) = interactive.prompt.take() {
+    let prompt_peers = if let Some(prompt) = interactive.prompt.take() {
         // Normalize CRLF/CR to LF so CLI-provided text can't leak `\r` into TUI state.
-        interactive.prompt = Some(prompt.replace("\r\n", "\n").replace('\r', "\n"));
+        let prompt = prompt.replace("\r\n", "\n").replace('\r', "\n");
+        // Pulsing is on for a front-door prompt. spawn_agent follows the multi-agent model messages.
+        match codex_core::prepare_prompt_peers(&prompt).await {
+            Ok(prepared) => {
+                interactive.prompt = Some(prepared.prompt);
+                prepared.peers
+            }
+            Err(err) => return Ok(AppExitInfo::fatal(format!("{err:#}"))),
+        }
+    } else {
+        None
+    };
+
+    // Collaboration stays in the log stream. The full-screen TUI stays for a normal chat.
+    if prompt_peers.is_some() {
+        let mut exec_cli = ExecCli::try_parse_from(["codex", "exec", "--skip-git-repo-check"])
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
+        exec_cli
+            .shared
+            .inherit_exec_root_options(&interactive.shared);
+        exec_cli.strict_config |= interactive.strict_config;
+        exec_cli.config_overrides = interactive.config_overrides.clone();
+        exec_cli.prompt = interactive.prompt.clone();
+        eprintln!(
+            "pulsing: 已打开组网，过程日志如下。结果交给用户后自动结束。"
+        );
+        let result = codex_exec::run_main(exec_cli, arg0_paths).await;
+        drop(prompt_peers);
+        return match result {
+            Ok(()) => Ok(AppExitInfo {
+                token_usage: TokenUsage::default(),
+                thread_id: None,
+                resume_hint: None,
+                disconnect_info: None,
+                update_action: None,
+                exit_reason: ExitReason::UserRequested,
+            }),
+            Err(err) => Ok(AppExitInfo::fatal(format!("{err:#}"))),
+        };
     }
 
     let terminal_info = codex_terminal_detection::terminal_info();
@@ -2889,7 +2953,9 @@ async fn run_interactive_tui(
             remote_endpoint.clone(),
         )
     };
-    run_tui_with_recovery(start_tui, remote_auth_token_env.as_deref()).await
+    let exit = run_tui_with_recovery(start_tui, remote_auth_token_env.as_deref()).await;
+    drop(prompt_peers);
+    exit
 }
 
 async fn run_tui_with_recovery<F, Fut>(

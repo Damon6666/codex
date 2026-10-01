@@ -82,11 +82,17 @@ pub async fn inter_agent_communication(
     start_options: codex_protocol::turn_input::TurnStartOptions,
 ) {
     let trigger_turn = communication.trigger_turn;
+    if std::env::var("CODEX_PULSING_TRACE").is_ok() {
+        eprintln!("TRACE[mail] enqueue trigger={trigger_turn} sub={sub_id}");
+    }
     sess.input_queue
         .enqueue_mailbox_communication(communication, start_options)
         .await;
     crate::agent_communication::emit_agent_communication_receive(&sub_id);
     if trigger_turn || sess.has_outstanding_durable_sleep() {
+        if std::env::var("CODEX_PULSING_TRACE").is_ok() {
+            eprintln!("TRACE[mail] wake requested sub={sub_id}");
+        }
         sess.maybe_start_turn_for_pending_work_with_sub_id(sub_id)
             .await;
     }
