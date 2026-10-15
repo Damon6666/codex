@@ -1,0 +1,146 @@
+==========================================================================
+ 图1: pulsing-team 模式 代码调用时序图
+ 命令: .\codex-rs\target\debug\codex.exe "写一个 sklearn LogisticRegression
+       训练脚本，切分 train/test 之前先做标准化"
+ 环境: CODEX_PULSING=1, CODEX_PULSING_TEAM=pulsing-team.toml
+ 参与方: 你 / judge进程(codex.exe) / worker进程×3 / pulsing-actor集群 / watchdog
+==========================================================================
+
+【阶段A 启动期 —— judge 第一个 turn 之前，全部由 harness 完成】
+
+ 你(PowerShell)
+   │ codex.exe "写一个sklearn…"
+   ▼
+ cli/main.rs 启动
+   │
+   ├─> pulsing::prepare_prompt_peers(prompt)              core/src/pulsing/mod.rs:1084
+   │     │
+   │     ├─ load_team_spec(CODEX_PULSING_TEAM)            mod.rs:995
+   │     │    读 pulsing-team.toml → TeamSpec{workers[3], preamble_file,
+   │     │    nudge_after_secs=240, max_nudges=3}
+   │     │
+   │     ├─ free_loopback_ports(range)                    mod.rs:1104
+   │     │    judge 分到 127.0.0.1:8101
+   │     │
+   │     ├─ [set_var] CODEX_PULSING=1                     mod.rs:1112
+   │     │             CODEX_PULSING_NAME=codex(judge店名)
+   │     │             CODEX_PULSING_LISTEN=127.0.0.1:8101
+   │     │             [remove] SEEDS/ROLE/WAIT/READY     (防worker继承)
+   │     │
+   │     ├─ spawn_team(spec, 8101)                         mod.rs:1049
+   │     │    ├─ exclude_judge_port(8102..8104)            mod.rs:1036
+   │     │    ├─ spawn_one(writer,   8102, role, model, workspace-write)
+   │     │    │    mod.rs:1155 ──> 子进程:
+   │     │    │      codex.exe exec --skip-git-repo-check --ephemeral
+   │     │    │               -c model="gpt-5.6-luna" --sandbox workspace-write
+   │     │    │               <role文本作为初始prompt>
+   │     │    │      env: CODEX_PULSING=1 NAME=writer LISTEN=127.0.0.1:8102
+   │     │    │           SEEDS=127.0.0.1:8101 ROLE=<role> PULSING_WAIT=1
+   │     │    │      stderr ──> /tmp/codex-pulsing-writer.err
+   │     │    │      [日志实证] PULSING_WAIT shop=writer listen=127.0.0.1:8102
+   │     │    ├─ wait_for_port(8102)  ← worker就绪门槛
+   │     │    ├─ spawn_one(review-scaler, 8103, read-only)  …同上
+   │     │    └─ spawn_one(review-duprow, 8104, read-only)  …同上
+   │     │         每个worker进程内部:
+   │     │           attach_root → pulsing-actor集群 → 前台actor shops/<name>
+   │     │           进入待命(不烧模型turn)
+   │     │
+   │     ├─ spawn_reply_watchdog(240s, 3次)                mod.rs:1126→268
+   │     │    tokio::spawn, 每10s tick一次
+   │     │
+   │     └─ build_wrapper_prompt(spec, judge, 原prompt)    mod.rs:1015
+   │          = PULSING.md模板.replace({judge}=codex, {duties}=三行职责)
+   │            + "\n\n用户的原话：\n<你输入的任务>"
+   │
+   ├─> Session 创建
+   │     session/session.rs:1767 attach_root(control, thread_id)
+   │       → judge 加入 pulsing-actor 集群(127.0.0.1:8101)
+   │       → 前台actor挂到 shops/codex
+   │
+   ▼
+【阶段B judge 首轮 —— 模型读简报、派第一封信】
+
+ tasks/mod.rs 调度器 maybe_start → 抢占 ActiveTurn → turn#1 启动
+   输入上下文 = 编排简报(阶段A产物)
+   note_judge_busy(true)                              mod.rs:223
+   │
+   ├─ judge LLM 推理 → 决定: 调用工具 followup_task(target="writer",
+   │  message="任务信…请写sklearn脚本…写完寄回codex")
+   │
+   ├─> tools/handlers/multi_agents_v2/message_tool.rs:57
+   │      if pulsing::enabled() ──是──> 走⑤层
+   │
+   ├─> pulsing::send_remote(session, turn, target, body,   mod.rs:400
+   │      mode=TriggerTurn, encrypted=false, shutdown=false)
+   │      ├─ ensure_runtime(拿到 ActorSystem)              mod.rs:413
+   │      ├─ resolve_named(system, "shops/writer")         解析目标actor地址
+   │      ├─ 打包 InterAgentWire{from_shop:"codex", to_shop:"writer",
+   │      │        body:<任务信>, trigger_turn:true}       peer.rs:8
+   │      ├─ peer.ask(wire) ══ pulsing-actor 集群投递 ══>
+   │      │
+   │      │        worker端 shops/writer 前台actor:
+   │      │        CodexPeer::receive(msg)                 peer.rs:35
+   │      │          ├─ msg.unpack() → InterAgentWire
+   │      │          ├─ record_inbound(wire)               mod.rs:35 (E2E记录)
+   │      │          └─ inject_local(control, root, wire)  mod.rs:576
+   │      │               ├─ trigger_turn=true → kind=Followup
+   │      │               ├─ inbound_preamble(wire)        mod.rs:563
+   │      │               │    "[pulsing codex]\n回信 target 填 codex。\n"+ROLE
+   │      │               ├─ InterAgentCommunication::new(…正文=前言+body)
+   │      │               └─ control.send_inter_agent_communication(...)
+   │      │                    └─> worker 的 tasks/mod.rs 调度器
+   │      │                         开worker turn → writer LLM 开始干活
+   │      │
+   │      ├─< DeliverAck{ok:true}                          peer.rs:24
+   │      ├─ note_reply_pending("writer")                  台账 pending=1
+   │      └─ 返回 FunctionToolOutput
+   │           "delivered via pulsing to shops/writer"     → judge看到工具结果
+   │
+   └─ turn#1 结束: judge无更多动作 → 调度器落闸
+        exit gate: pending_reply_count()=1 ≠ 0 → 会话保持,静默计时器重挂
+
+【阶段C worker 执行 —— writer 写代码并回信】
+
+ worker turn: writer LLM 产出脚本
+   └─ 调用 followup_task(target="codex", message=<完整脚本>)
+        → message_tool.rs:57 → send_remote → shops/codex
+        → judge端 CodexPeer::receive → inject_local:
+             note_reply_arrived("writer")                  台账 pending=0
+             judge 调度器开 turn#2, 上下文注入 [pulsing writer]回信+脚本
+
+【阶段D 审查循环 —— judge 分发盲审、按结论打回】
+
+ judge turn#2: 读脚本 → 依次 followup_task ×2
+   ├─> review-scaler (message=脚本原文, 店规:收不到原文回NEEDS_FIX)
+   │     台账 pending=1 → reviewer turn(read-only沙箱)
+   │     → followup_task(target=codex, "CLEAN"或"NEEDS_FIX+位置/原因/建议")
+   │     → 注入judge → pending=0
+   ├─> review-duprow …同上
+   │
+   ├─ 若有 NEEDS_FIX:
+   │     judge followup_task(target=writer, message=脚本+审查意见)
+   │     → writer改写再寄回 → 再审 …… 循环, 店规:最多打回3轮
+   │
+   └─ 全部 CLEAN → judge 写最终中文汇总 → turn结束
+        exit gate: pending=0 且静默期到 → 会话正常退出
+        PEER_CHILDREN 清理 worker 子进程 / shutdown wire 逐店通知
+
+【阶段E 兜底 —— watchdog 全程旁路运行】
+
+ spawn_reply_watchdog (mod.rs:268, 每10s tick):
+   ├─ 某 shop 无回信超240s → 自动 nudge:
+   │     send trigger_turn 邮件("还在吗") ──不消耗judge的判断
+   ├─ nudge 3次耗尽 → 台账删项 + send_self_notice 给judge:
+   │     "<shop> 多次催办仍无回信，已放弃等待。请汇总现有结论并收尾。"
+   │     → 唤醒judge收尾(keepalive机制防丢唤醒, JUDGE_BUSY时安静)
+   └─ keepalive self-notice (commit 899f555) 防静默期唤醒丢失
+
+==========================================================================
+ 关键文件索引:
+   mod.rs        内核主体(Settings/attach/send_remote/inject_local/team/watchdog)
+   peer.rs       CodexPeer前台actor + InterAgentWire消息格式
+   session.rs:1767  session创建时挂前台actor
+   message_tool.rs:57 ⑤层分叉点(pulsing开→跨进程,关→原版进程内)
+   tasks/mod.rs  turn调度器(zombie stub修复处) + 唤醒
+   config/mod.rs pulsing开→自动启用MultiAgentV2特性
+==========================================================================

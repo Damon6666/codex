@@ -1,0 +1,127 @@
+==========================================================================
+ 图2: pulsing-team 模式 消息内容时序图
+     —— 每一封"信"的具体内容(结合 pulsing-team.toml / PULSING.md / 运行日志)
+==========================================================================
+
+ 你                judge(店名codex)         writer(店8102)      review-scaler(8103)   review-duprow(8104)
+ │                     │                        │                    │                    │
+ │ "写一个sklearn      │                        │                    │                    │
+ │  LogisticRegression │                        │                    │                    │
+ │  训练脚本，切分前    │                        │                    │                    │
+ │  先做标准化"        │                        │                    │                    │
+ │────────────────────>│                        │                    │                    │
+ │                     │ [提示词被harness改写, judge的turn#1输入是这份编排简报]              │
+ │                     │ ┌────────────────────────────────────────────────┐              │
+ │                     │ │ 这些 Codex 已经按你的分工启动，并和你组在同一张网上。│              │
+ │                     │ │ 你的店名是 codex。                                │              │
+ │                     │ │ 只用 followup_task 把任务分给它们，target 填店名。  │              │
+ │                     │ │ followup_task 返回后这一轮结束，对方回信会另开一轮。│              │
+ │                     │ │ 不要调用 spawn_agent / wait_agent。               │              │
+ │                     │ │ 给审查员的信必须正文直接粘贴待审代码完整文本；       │              │
+ │                     │ │   只给文件路径→审查员回 NEEDS_FIX"未收到代码原文"。 │              │
+ │                     │ │ 有 NEEDS_FIX 就打回 writer 重写(最多3轮)。         │              │
+ │                     │ │ 全部完成后，用中文汇总结果。                        │              │
+ │                     │ │ 店名和职责：                                      │              │
+ │                     │ │ - writer：只写代码，交回完整脚本…                  │              │
+ │                     │ │ - review-scaler：只查切分前是否标准化…CLEAN/NEEDS_FIX│             │
+ │                     │ │ - review-duprow：没调drop_duplicates才NEEDS_FIX…  │              │
+ │                     │ │                                                  │              │
+ │                     │ │ 用户的原话：                                      │              │
+ │                     │ │ 写一个 sklearn LogisticRegression 训练脚本，      │              │
+ │                     │ │ 切分 train/test 之前先做标准化                     │              │
+ │                     │ └────────────────────────────────────────────────┘              │
+ │                     │                        │                    │                    │
+ │                     │ (worker此时已待命: 日志实证 "PULSING_WAIT shop=writer │              │
+ │                     │  listen=127.0.0.1:8102", 初始prompt=TOML里的role文本) │              │
+ │                     │                        │                    │                    │
+ │                     │ ══ 信1: judge→writer (followup_task) ══           │                    │
+ │                     │───InterAgentWire────────>│                │                    │
+ │                     │ { from_shop:"codex",    │                │                    │
+ │                     │   from_thread:"<tid>",  │                │                    │
+ │                     │   to_shop:"writer",     │                │                    │
+ │                     │   body:"任务: 写sklearn │                │                    │
+ │                     │    LogisticRegression  │                │                    │
+ │                     │    训练脚本，切分前先   │                │                    │
+ │                     │    标准化。写完把完整   │                │                    │
+ │                     │    脚本放进回信",       │                │                    │
+ │                     │   trigger_turn:true,   │                │                    │
+ │                     │   encrypted:false,     │                │                    │
+ │                     │   shutdown:false }     │                │                    │
+ │                     │<──DeliverAck{ok:true}───│                │                    │
+ │                     │ [台账: pending(writer)=1]               │                    │
+ │                     │ [judge看到: "delivered via pulsing to shops/writer"]          │
+ │                     │ [turn#1结束; exit gate拦住: pending=1]   │                    │
+ │                     │                        │                │                    │
+ │                     │          writer收到注入上下文 = 前言+正文:       │                    │
+ │                     │          ┌──────────────────────────────┐              │                    │
+ │                     │          │ [pulsing codex]              │ ←harness手写   │                    │
+ │                     │          │ 回信 target 填 codex。       │   (教它回信地址) │                    │
+ │                     │          │ <writer的role文本>           │              │                    │
+ │                     │          │                              │              │                    │
+ │                     │          │ 任务: 写sklearn…(信1正文)    │              │                    │
+ │                     │          └──────────────────────────────┘              │                    │
+ │                     │                        │                │                    │
+ │                     │                        │→ gpt-5.6-luna(workspace-write沙箱)      │
+ │                     │                        │  生成脚本      │                    │
+ │                     │                        │                │                    │
+ │                     │ ══ 信2: writer→judge (回信) ══           │                    │
+ │                     │<──InterAgentWire────────│                │                    │
+ │                     │ { from_shop:"writer",   │                │                    │
+ │                     │   to_shop:"codex",      │                │                    │
+ │                     │   body:"<完整Python脚本  │                │                    │
+ │                     │    原文: from sklearn…  │                │                    │
+ │                     │    StandardScaler…>",   │                │                    │
+ │                     │   trigger_turn:true }   │                │                    │
+ │                     │ [台账: pending(writer)=0; judge turn#2开]  │                │
+ │                     │                        │                │                    │
+ │                     │ ══ 信3/4: judge→两位盲审 (正文=脚本原文, 按店规禁止只给路径)      │
+ │                     │──────────────────────────────────────────>│                │
+ │                     │──────────────────────────────────────────────────────────>│
+ │                     │ { to_shop:"review-scaler", body:<脚本原文>, trigger_turn:true }   │
+ │                     │ { to_shop:"review-duprow",  body:<脚本原文>, trigger_turn:true }   │
+ │                     │ [台账: pending=2]      │                │                    │
+ │                     │                        │                │→ 只读沙箱审查      │
+ │                     │                        │                │                    │→ 只读沙箱审查
+ │                     │                        │                │                    │
+ │                     │ ══ 信5: review-scaler→judge ══           │                    │
+ │                     │<────────────────────────│ "CLEAN"        │                    │
+ │                     │                        │ 或 "NEEDS_FIX: <代码位置>              │
+ │                     │                        │   切分前未标准化; <原因>; <一句建议>"  │
+ │                     │ ══ 信6: review-duprow→judge ══                                │
+ │                     │<────────────────────────────────────────────│ "CLEAN" 或      │
+ │                     │                        │   "NEEDS_FIX: 未调用drop_duplicates…"│
+ │                     │ [台账: pending=0]      │                │                    │
+ │                     │                        │                │                    │
+ │                     │ [若 NEEDS_FIX] ══ 信7: judge→writer 打回 ══                  │
+ │                     │───{ body:<脚本>+<审查意见>, trigger_turn:true }──>│           │
+ │                     │   writer改写→回信→再审… (店规上限: 打回3轮)    │           │
+ │                     │                        │                │                    │
+ │                     │ [全部CLEAN后] judge turn#N: 写最终中文汇总  │                │
+ │                     │ [台账=0 + 静默期满 → exit gate放行, 会话结束, 逐店shutdown]     │
+ │<────────────────────│                        │                │                    │
+ │ "任务完成: 脚本如下…  │                        │                │                    │
+ │  writer交付: …       │                        │                │                    │
+ │  review-scaler: CLEAN│                        │                │                    │
+ │  review-duprow: CLEAN│                        │                │                    │
+ │  (中文汇总)"         │                        │                │                    │
+ │                     │                        │                │                    │
+─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ 旁路: watchdog(系统角色, 不是codex) ─ ─ ─ ─ ─ ─
+ │                     │                        │                │                    │
+ │                     │ [任一封信240s无回信] 自动催办(不问judge):                  │
+ │                     │──nudge信{trigger_turn:true}──>│ 醒来继续     │                │
+ │                     │ [催3次仍无回信] 台账删项+给judge发自通知:                   │
+ │                     │<─"{shop} 多次催办仍无回信，已放弃等待。请汇总现有结论并收尾。"│
+ │                     │ [judge被唤醒, 带着现有结论收尾]           │                │
+
+==========================================================================
+ 消息格式速查 (InterAgentWire, peer.rs:8):
+   from_shop/to_shop : 店名(即actor路径 shops/<name>)
+   from_thread       : 发信会话的ThreadId
+   body              : 信件正文(给审查员必须是代码原文)
+   trigger_turn      : true=收信方必须开新turn(followup语义)
+                       false=只投递入上下文,等下次自然turn(send_message禁止用于回信)
+   encrypted         : true=body是API侧加密参数(需原样回传)
+   shutdown          : true=请对端退网, 不开turn
+ 店规红线 (PULSING.md):
+   回信只能用followup_task / 审查信必须贴代码原文 / 最多打回3轮 / 最终中文汇总
+==========================================================================

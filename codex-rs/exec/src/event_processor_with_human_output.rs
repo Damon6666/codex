@@ -98,11 +98,34 @@ impl EventProcessorWithHumanOutput {
     fn render_item_completed(&mut self, item: ThreadItem) {
         match item {
             ThreadItem::AgentMessage { text, .. } => {
-                eprintln!(
-                    "{}\n{}",
-                    "codex".style(self.italic).style(self.magenta),
-                    text
+                // Unified-log narration: timestamped and indented so it rides
+                // the same `^\[|^  ` filter as the mesh interaction lines, and
+                // the judge's dispatch echoes (派单留痕) are visible in demos.
+                // Raw mesh identity for the JSONL stream (must agree with
+                // mail-layer names); with shop="judge" in the team tomls the
+                // raw name already reads "judge". Display-only mapping stays
+                // on the human stderr line for bare runs named "codex".
+                let shop = std::env::var("CODEX_PULSING_NAME").unwrap_or_default();
+                let who: &str = if shop.is_empty() {
+                    "codex"
+                } else {
+                    shop.as_str()
+                };
+                let who_disp = if who == "codex" { "judge" } else { who };
+                let body = text
+                    .lines()
+                    .map(|line| format!("  {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                codex_core::emit_event(
+                    "narration",
+                    serde_json::json!({"who": who, "body": text}),
                 );
+                // Feed `派单→X` echo blocks to the echo-debt ledger so the
+                // exit gates can verify every encrypted letter's plaintext
+                // audit record (encrypted args have no local plaintext).
+                codex_core::note_dispatch_echoes(&text);
+                eprintln!("{} {who_disp} 叙述:\n{body}", crate::chronoless_stamp());
                 self.final_message = Some(text);
                 self.final_message_rendered = true;
             }
@@ -491,7 +514,7 @@ fn reasoning_text(
     }
 }
 
-fn final_message_from_turn_items(items: &[ThreadItem]) -> Option<String> {
+pub(crate) fn final_message_from_turn_items(items: &[ThreadItem]) -> Option<String> {
     items
         .iter()
         .rev()

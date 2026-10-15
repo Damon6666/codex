@@ -464,12 +464,22 @@ impl Session {
 
         let turn_state = {
             let mut active_turn = self.active_turn.lock().await;
-            if active_turn.is_some() {
-                if trace {
-                    let has_task = active_turn.as_ref().is_some_and(|t| t.task.is_some());
-                    eprintln!("TRACE[wake] return: active_turn occupied (task_running={has_task})");
+            if let Some(existing) = active_turn.as_ref() {
+                if existing.task.is_some() {
+                    // A real turn is running; the completion path will re-check
+                    // the mailbox when it finishes.
+                    if trace {
+                        eprintln!("TRACE[wake] return: real turn running");
+                    }
+                    return;
                 }
-                return;
+                // Zombie stub (task=None): a previous maybe_start inserted a
+                // placeholder but never launched a task. Clear it so this
+                // wake-up can proceed instead of blocking forever.
+                if trace {
+                    eprintln!("TRACE[wake] clearing zombie stub (task=None)");
+                }
+                *active_turn = None;
             }
             let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
             Arc::clone(&active_turn.turn_state)

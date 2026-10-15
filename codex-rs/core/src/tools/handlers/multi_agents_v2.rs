@@ -25,6 +25,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 
+pub(crate) use fanout_task::Handler as FanoutTaskHandler;
 pub(crate) use followup_task::Handler as FollowupTaskHandler;
 pub(crate) use interrupt_agent::Handler as InterruptAgentHandler;
 pub(crate) use list_agents::Handler as ListAgentsHandler;
@@ -33,6 +34,7 @@ pub(crate) use spawn::Handler as SpawnAgentHandler;
 pub(crate) use wait::Handler as WaitAgentHandler;
 
 mod analytics;
+mod fanout_task;
 mod followup_task;
 mod interrupt_agent;
 mod list_agents;

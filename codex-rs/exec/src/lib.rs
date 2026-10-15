@@ -112,6 +112,7 @@ use codex_worktree::CreateWorktree;
 use codex_worktree::WorktreeManager;
 use codex_worktree::WorktreeSettings;
 use event_processor_with_human_output::EventProcessorWithHumanOutput;
+use event_processor_with_human_output::final_message_from_turn_items;
 pub use event_processor_with_jsonl_output::CodexStatus;
 pub use event_processor_with_jsonl_output::CollectedThreadEvents;
 pub use event_processor_with_jsonl_output::EventProcessorWithJsonOutput;
@@ -1230,11 +1231,26 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     // Track whether a fatal error was reported by the server so we can
     // exit with a non-zero status for automation-friendly signaling.
     let mut error_seen = false;
-    let mut interrupt_channel_open = true;
+        // Sticky error memory: turn-end clears `error_seen`, but a run that ends
+        // without delivering anything must still exit non-zero (429-exhausted
+        // runs used to die as exit 0 with empty output).
+        let mut ever_error = false;
+        // Fabrication gate: a team judge that reports review conclusions without
+        // ever dispatching a single task mail has invented them.
+        let mut turn_counter: u64 = 0;
+        let mut fabrication_warned = false;
+        let mut last_echo_gaps = usize::MAX;
+        let mut last_unresolved = usize::MAX;
+            let mut interrupt_channel_open = true;
     let mut mesh_told_user = false;
     let mut mesh_mailed = false;
     let mut mesh_reply = String::new();
     let mut mesh_quiet_at: Option<tokio::time::Instant> = None;
+    /// Timestamp of the most recent gate-reminder injection (completeness,
+    /// reply-verdict). The quiet-exit path waits ≥5s after any reminder to
+    /// avoid killing the run before the judge can act on it.
+    static LAST_GATE_REMINDER: std::sync::OnceLock<std::sync::Mutex<std::time::Instant>> =
+        std::sync::OnceLock::new();
     let mut ever_mailed = false;
     let primary_thread_id_for_requests = primary_thread_id.to_string();
     loop {
@@ -1299,6 +1315,24 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                 {
                     task_id = started.turn.id.clone();
                     codex_core::note_judge_busy(true);
+                    codex_core::clear_force_exit();
+                    // Turn-scoped marker reset: the 补寄 dedup must never
+                    // match against a previous turn's send.
+                    codex_core::clear_last_sent_to();
+                    codex_core::emit_event(
+                        "turn_start",
+                        serde_json::json!({"turn": turn_counter,
+                            "pending": codex_core::pending_reply_count(),
+                            "outstanding": codex_core::mesh_outstanding(),
+                            "sent_total": codex_core::tasks_sent_total()}),
+                    );
+                    eprintln!(
+                        "pulsing: {{\"ev\":\"turn_start\",\"turn\":{},\"pending\":{},\"outstanding\":{},\"sent_total\":{}}}",
+                        turn_counter,
+                        codex_core::pending_reply_count(),
+                        codex_core::mesh_outstanding(),
+                        codex_core::tasks_sent_total()
+                    );
                 }
                 if let ServerNotification::Error(payload) = &notification {
                     if payload.thread_id == primary_thread_id_for_requests
@@ -1306,17 +1340,32 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                         && !payload.will_retry
                     {
                         error_seen = true;
+                        ever_error = true;
                     }
                 } else if let ServerNotification::TurnCompleted(payload) = &notification
                     && payload.thread_id == primary_thread_id_for_requests
                     && payload.turn.id == task_id
-                    && matches!(
-                        payload.turn.status,
-                        codex_app_server_protocol::TurnStatus::Failed
-                            | codex_app_server_protocol::TurnStatus::Interrupted
-                    )
                 {
-                    error_seen = true;
+                    // Delivery verdict at the single point where the output
+                    // processor also decides final_message. For an orchestration
+                    // judge every turn ends with narration, so a final agent
+                    // message carries no signal; what counts as "delivered" is
+                    // having actually dispatched work into the mesh, or having
+                    // no team at all (plain Q&A shape). Failed/interrupted turns
+                    // deliver nothing.
+                    match payload.turn.status {
+                        codex_app_server_protocol::TurnStatus::Completed => {
+                            mesh_told_user = codex_core::tasks_sent_total() > 0
+                                || codex_core::team_size() == 0;
+                        }
+                        codex_app_server_protocol::TurnStatus::Failed
+                        | codex_app_server_protocol::TurnStatus::Interrupted => {
+                            mesh_told_user = false;
+                            error_seen = true;
+                            ever_error = true;
+                        }
+                        _ => {}
+                    }
                 }
 
                 note_mesh_turn(
@@ -1342,6 +1391,23 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                         CodexStatus::Running => {}
                         CodexStatus::InitiateShutdown => {
                             codex_core::note_judge_busy(false);
+                            turn_counter += 1;
+                            codex_core::emit_event(
+                                "turn_end",
+                                serde_json::json!({"turn": turn_counter, "told_user": mesh_told_user,
+                                    "mailed": mesh_mailed, "pending": codex_core::pending_reply_count(),
+                                    "outstanding": codex_core::mesh_outstanding(),
+                                    "sent_total": codex_core::tasks_sent_total(),
+                                    "error_seen": error_seen}),
+                            );
+                            eprintln!(
+                                "pulsing: {{\"ev\":\"turn_end\",\"turn\":{},\"told_user\":{},\"mailed\":{},\"pending\":{},\"outstanding\":{},\"sent_total\":{},\"error_seen\":{}}}",
+                                turn_counter, mesh_told_user, mesh_mailed,
+                                codex_core::pending_reply_count(),
+                                codex_core::mesh_outstanding(),
+                                codex_core::tasks_sent_total(),
+                                error_seen
+                            );
                             let mailed_remote = codex_core::take_turn_mailed();
                             if mailed_remote {
                                 ever_mailed = true;
@@ -1358,25 +1424,294 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                                 && !mesh_mailed
                                 && !mailed_remote
                                 && codex_core::pending_reply_count() == 0;
+                            if mesh_told_user {
+                                codex_core::note_user_delivered();
+                            }
+                            // Fabrication gate (fleet stop-verify analogue): with a
+                            // team spawned, claiming conclusions with zero dispatches
+                            // means the judge invented them. First offense: warn and
+                            // force a real dispatch attempt; repeat offense: degrade.
+                            if codex_core::team_size() > 0
+                                && codex_core::tasks_sent_total() == 0
+                                && mesh_told_user
+                                && !pulsing_child()
+                            {
+                                if !fabrication_warned {
+                                    fabrication_warned = true;
+                                    eprintln!(
+                                        "pulsing: 编造闸门: 宣称了结论但从未给任何店派活。要求真实派活后再汇报。"
+                                    );
+                                    let _ = codex_core::send_fabrication_notice().await;
+                                    mesh_told_user = false;
+                                    // Absolute backstop now lives in the core watchdog
+                                    // (fires even if this notice fails to wake a turn).
+                                    codex_core::arm_fabrication_deadline(120);
+                                } else {
+                                    codex_core::mark_exit_error();
+                                    eprintln!(
+                                        "pulsing: 编造闸门(二次): 仍未派活, 结论不可信, 强制以失败退出。"
+                                    );
+                                }
+                            }
+                            // Dispatch-completeness gate: the summary moment is
+                            // where starved reviewers get silently dropped.
+                            // Any roster shop with no mail since the last
+                            // writer dispatch is a gap: remind (max 3), then
+                            // degrade honestly instead of skipping quietly.
+                            if pulsing_wait
+                                && !pulsing_child()
+                                && mesh_told_user
+                                && codex_core::pending_reply_count() == 0
+                            {
+                                let missing = codex_core::dispatch_gap();
+                                if !missing.is_empty() {
+                                    if codex_core::completeness_reminders() < 3 {
+                                        codex_core::note_completeness_reminder();
+                                        eprintln!(
+                                            "pulsing: 派发完整性闸门: 汇报时这些协作店本轮从未收到任务信: {:?} — 注入补发提醒。",
+                                            missing
+                                        );
+                                        let _ = LAST_GATE_REMINDER.get_or_init(|| std::sync::Mutex::new(std::time::Instant::now())).lock().map(|mut t| *t = std::time::Instant::now());
+                                        let _ = codex_core::send_completeness_notice(&missing).await;
+                                        mesh_told_user = false;
+                                    } else {
+                                        codex_core::mark_degraded();
+                                        eprintln!(
+                                            "pulsing: 派发完整性闸门(提醒已3次): {} 仍缺席, 结论标记降级完成。",
+                                            missing.join("、")
+                                        );
+                                    }
+                                }
+                            }
+                            // Dispatch-echo gate: encrypted letters are
+                            // unauditable without their `派单→X` narration
+                            // echo. Missing echoes break the plaintext audit
+                            // chain ("漏写即视为该次派活未发生") — block the
+                            // summary and demand the echo. The budget resets
+                            // whenever debt SHRINKS (productive repair buys
+                            // more wakes); only a stagnant loop hits the cap
+                            // and degrades honestly.
+                            if pulsing_wait
+                                && !pulsing_child()
+                                && mesh_told_user
+                            {
+                                let gaps = codex_core::echo_gaps();
+                                if !gaps.is_empty() {
+                                    if gaps.len() < last_echo_gaps {
+                                        codex_core::reset_echo_reminders();
+                                    }
+                                    last_echo_gaps = gaps.len();
+                                    if codex_core::echo_reminders() < 6 {
+                                        codex_core::note_echo_reminder();
+                                        eprintln!(
+                                            "pulsing: 留痕闸门: 这些信件缺少有效派单留痕: {:?} — 注入补写提醒。",
+                                            gaps
+                                        );
+                                        let _ = LAST_GATE_REMINDER.get_or_init(|| std::sync::Mutex::new(std::time::Instant::now())).lock().map(|mut t| *t = std::time::Instant::now());
+                                        let _ = codex_core::send_echo_notice(&gaps).await;
+                                        mesh_told_user = false;
+                                    } else {
+                                        codex_core::mark_degraded();
+                                        eprintln!(
+                                            "pulsing: 留痕闸门(提醒已6次): {:?} 仍缺留痕, 结论标记降级完成。",
+                                            gaps
+                                        );
+                                    }
+                                }
+                            }
+                            // Bug#8 backstop: whatever the gate decided, if the
+                            // event stream goes silent now (429-killed turn etc.)
+                            // the watchdog fires a final self-notice after 90s
+                            // so the loop wakes and exits instead of hanging.
+                            // When replies are pending (someone is working),
+                            // the watchdog nudge at 240s is the appropriate
+                            // timeout — a 90s force-exit here would cut off a
+                            // worker that's simply writing a long script.
+                            let pending = codex_core::pending_reply_count();
+                            codex_core::arm_force_exit(if pending > 0 { 600 } else { 90 });
+                            // A04 fix: once the gate has told the user and the
+                            // verdict is complete, waiting for stragglers only
+                            // burns the clock — late mail is discarded by design.
+                            // Verdict is computed fresh here: a stale "complete"
+                            // would mislabel a degraded run's ledger EXIT.
+                            // error_seen (stream/API errors) is part of the
+                            // verdict: without it a failed attempt could emit
+                            // exit=complete and then die with exit code 1.
+                            // Mechanical acceptance: the machine-verifiable
+                            // verdict on the final script runs before any
+                            // "complete" is recorded — and re-runs on a
+                            // "degraded" verdict too, because a previous
+                            // acceptance failure marks degraded and ONLY a
+                            // passing re-check can clear it (fix-cycle
+                            // convergence). Without the re-run the run
+                            // deadlocks in degraded forever.
+                            let mut exit_verdict = if codex_core::exit_error() || error_seen {
+                                "error"
+                            } else if codex_core::degraded() {
+                                "degraded"
+                            } else {
+                                "complete"
+                            };
+                            if exit_verdict != "error" {
+                                match codex_core::run_acceptance_check() {
+                                    Some(true) => {
+                                        codex_core::acceptance_recovered();
+                                        if !codex_core::degraded() {
+                                            exit_verdict = "complete";
+                                        }
+                                    }
+                                    Some(false) => {
+                                        if codex_core::verdict_wakes() < 6 {
+                                            codex_core::note_verdict_wake();
+                                            eprintln!(
+                                                "pulsing: 机械验收未通过 — 阻止退出并注入修复提醒(打回锚点 → fanout 复审)"
+                                            );
+                                            let _ = LAST_GATE_REMINDER.get_or_init(|| std::sync::Mutex::new(std::time::Instant::now())).lock().map(|mut t| *t = std::time::Instant::now());
+                                            let _ = codex_core::send_acceptance_notice().await;
+                                            mesh_told_user = false; // block exit, loop continues
+                                        }
+                                        codex_core::mark_acceptance_degraded();
+                                        exit_verdict = "degraded";
+                                    }
+                                    None => {}
+                                }
+                            }
+                            // Reply-verdict completeness: unresolved negative
+                            // verdicts (configured keyword) mean the task isn't done.
+                            // A registered-but-not-yet-re-dispatched draft
+                            // (pending_review) means the current version was
+                            // never reviewed — same conclusion: not done.
+                            // Block the fast-exit and wake the judge for another
+                            // fix cycle — this prevents false-success exits.
+                            let unresolved = codex_core::unresolved_negative_verdicts();
+                            let draft_pending = codex_core::pending_review();
+                            if exit_verdict == "complete" && (!unresolved.is_empty() || draft_pending) {
+                                if draft_pending && unresolved.is_empty() {
+                                    eprintln!(
+                                        "pulsing: 回复完整性闸门: 新底稿已登记但尚未群发复审, 不得以 complete 退出 — 唤醒 judge 复审"
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "pulsing: 回复完整性闸门: {} 的最新回信含未解决问题, 不得以 complete 退出 — 唤醒 judge 继续处理",
+                                        unresolved.join("、")
+                                    );
+                                }
+                                let _ = LAST_GATE_REMINDER.get_or_init(|| std::sync::Mutex::new(std::time::Instant::now())).lock().map(|mut t| *t = std::time::Instant::now());
+                                // Phase-aware wake text: if writer has already
+                                // submitted a corrected version after the NEEDS_FIX
+                                // replies, the correct action is re-dispatch for
+                                // re-review. If no fix has arrived, consolidate
+                                // and 打回. The old one-size-fits-all text caused
+                                // the judge to 打回 a fix that already existed.
+                                let fix_arrived = codex_core::writer_fix_arrived();
+                                let notice = if draft_pending && unresolved.is_empty() {
+                                    "锚点店已交回新版本底稿，但当前版本尚未经过审查。\
+                                     请立即调用 fanout_task 把最新底稿逐字群发给全部审查店复审，\
+                                     收齐结论后再收工。"
+                                        .to_string()
+                                } else if fix_arrived {
+                                    format!(
+                                        "以下协作店的最新回信含未解决问题({}: {}。\n\
+                                         writer 已交回修正版。请立即将修正版脚本全文逐字群发给全部审查店重新审查。\
+                                         不要再打回锚点店——修正版已到位。",
+                                        codex_core::negative_keyword(),
+                                        unresolved.join("、")
+                                    )
+                                } else {
+                                    format!(
+                                        "以下协作店的最新回信含未解决问题({}: {}。\n\
+                                         请把他们的审查意见汇总后打回锚点店修复，\
+                                         拿到修正版后重新群发全部审查店。",
+                                        codex_core::negative_keyword(),
+                                        unresolved.join("、")
+                                    )
+                                };
+                                let _ = codex_core::send_self_notice_text(&notice).await;
+                                mesh_told_user = false; // block fast exit
+                            }
+                            if exit_verdict != "error"
+                                && mesh_told_user
+                                && codex_core::pending_reply_count() == 0
+                                && codex_core::review_dispatch_count() > 0
+                                && !codex_core::anchor_in_flight()
+                                && !pulsing_child()
+                            {
+                                eprintln!("{} judge 操作: 全部结论收齐, 立即优雅退出(迟到信件丢弃, verdict={exit_verdict})", chronoless_stamp());
+                                codex_core::emit_event(
+                                    "exit",
+                                    serde_json::json!({"verdict": exit_verdict, "graceful": true}),
+                                );
+                                codex_core::ledger_exit(exit_verdict);
+                                if let Err(err) = request_shutdown(
+                                    &client,
+                                    &mut request_ids,
+                                    &primary_thread_id_for_requests,
+                                )
+                                .await
+                                {
+                                    warn!("thread/unsubscribe failed during shutdown: {err}");
+                                }
+                                break;
+                            }
+                            // Pre-arm the error verdict so the gate line below
+                            // reports it (the fast-exit branch runs after printing).
+                            if pulsing_wait
+                                && !pulsing_child()
+                                && error_seen
+                                && !mesh_told_user
+                                && !ever_mailed
+                                && codex_core::pending_reply_count() == 0
+                            {
+                                codex_core::mark_exit_error();
+                            }
                             eprintln!(
                                 "pulsing: exit gate told_user={mesh_told_user} mailed={mesh_mailed} \
-                                 remote={mailed_remote} pending={} outstanding={}",
+                                 remote={mailed_remote} pending={} outstanding={} \
+                                 verdict={}",
                                 codex_core::pending_reply_count(),
-                                codex_core::mesh_outstanding()
-                            );
-                            if pulsing_child() && !mailed_assigner && codex_core::last_inbound_from().is_some()
-                            {
-                                let reply = if mesh_reply.trim().is_empty() {
-                                    "这一轮没有产出。".to_string()
+                                codex_core::mesh_outstanding(),
+                                if codex_core::exit_error() {
+                                    "error"
+                                } else if codex_core::degraded() {
+                                    "degraded"
                                 } else {
-                                    mesh_reply.clone()
-                                };
+                                    "complete"
+                                }
+                            );
+                            // Auto-resend (补寄): forward the worker's narration
+                            // text on EVERY turn that had an inbound letter.
+                            // No mailed-flag gating (all variants proved leaky:
+                            // mailed_remote, mailed_assigner — each misses cases
+                            // where the model sent a tool call but the reply
+                            // content wasn't captured, or sent to the wrong
+                            // shop). A rare duplicate reply is far cheaper
+                            // than the 190s watchdog-nudge stall this replaces.
+                            if pulsing_child()
+                                && codex_core::last_inbound_from().is_some()
+                                && !mesh_reply.trim().is_empty()
+                                // Precise dedup (turn-scoped): skip the
+                                // auto-forward when THIS turn already
+                                // delivered a tool reply to the inbound
+                                // sender — the narration duplicate is what
+                                // produced the observed cipher+plaintext
+                                // double sends. The old ANY-send flag was
+                                // removed for missing genuine failures;
+                                // matching sender==last_sent exactly keeps
+                                // the safety net while killing the duplicate.
+                                && !codex_core::turn_replied_to_inbound()
+                            {
+                                let reply = mesh_reply.clone();
+                                eprintln!(
+                                    "pulsing: 补寄检查 ({}字叙述, 来信方: {:?})",
+                                    reply.chars().count(),
+                                    codex_core::last_inbound_from()
+                                );
                                 match codex_core::forward_unsent_reply(&reply).await {
                                     Ok(()) => eprintln!(
-                                        "pulsing: 本轮没有把结果寄回来信的店，已补寄。"
+                                        "pulsing: 补寄完成。"
                                     ),
                                     Err(err) => {
-                                        eprintln!("pulsing: 未能把结果寄回: {err}");
+                                        eprintln!("pulsing: 补寄失败(可能已寄出): {err}");
                                     }
                                 }
                             }
@@ -1394,6 +1729,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                                     eprintln!(
                                         "pulsing: 首轮即失败(模型错误,可能满载), 结束监听; 请换模型重跑。"
                                     );
+                                    codex_core::mark_exit_error();
                                     codex_core::kill_peer_children();
                                     let _ = request_shutdown(
                                         &client,
@@ -1417,8 +1753,121 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                                 if !pulsing_child()
                                     && codex_core::pending_reply_count() == 0
                                     && mesh_quiet_at.is_some_and(|at| tokio::time::Instant::now() >= at)
+                                    // Grace period: if a completeness/gate reminder
+                                    // was just injected (within 5s), give the judge
+                                    // time to act on it before allowing exit. Prevents
+                                    // the "reminder injected and killed in same second"
+                                    // race observed in adversarial testing.
+                                    && LAST_GATE_REMINDER
+                                        .get_or_init(|| std::sync::Mutex::new(
+                                            std::time::Instant::now()
+                                                - std::time::Duration::from_secs(60)))
+                                        .lock()
+                                        .map(|t| t.elapsed())
+                                        .unwrap_or_default()
+                                        > std::time::Duration::from_secs(5)
                                 {
-                                    eprintln!("pulsing: 结果已交给用户，结束并关掉后台 Codex。");
+                                    // Last-chance completeness check: a run can
+                                    // reach the quiet exit through mail-only turns
+                                    // that never present the summary-moment
+                                    // condition — starved reviewers would slip
+                                    // out unflagged. Block the exit once per
+                                    // reminder budget, then degrade honestly.
+                                    let missing = codex_core::dispatch_gap();
+                                    if !missing.is_empty()
+                                        && codex_core::completeness_reminders() < 3
+                                    {
+                                        codex_core::note_completeness_reminder();
+                                        eprintln!(
+                                            "pulsing: 派发完整性闸门(静默退出前): {:?} 仍缺席 — 阻止退出并注入补发提醒。",
+                                            missing
+                                        );
+                                        let _ = LAST_GATE_REMINDER.get_or_init(|| std::sync::Mutex::new(std::time::Instant::now())).lock().map(|mut t| *t = std::time::Instant::now());
+                                        let _ = codex_core::send_completeness_notice(&missing).await;
+                                        mesh_quiet_at = None;
+                                        continue;
+                                    }
+                                    if !missing.is_empty() {
+                                        codex_core::mark_degraded();
+                                        eprintln!(
+                                            "pulsing: 派发完整性(最终): {} 缺席, 以降级完成收尾。",
+                                            missing.join("、")
+                                        );
+                                    }
+                                    // Echo gate on the quiet path: give the judge
+                                    // one wake to backfill missing echoes before
+                                    // the final exit records them as degraded.
+                                    let gaps_quiet = codex_core::echo_gaps();
+                                    if !gaps_quiet.is_empty()
+                                        && codex_core::echo_reminders() < 6
+                                    {
+                                        codex_core::note_echo_reminder();
+                                        eprintln!(
+                                            "pulsing: 留痕闸门(静默退出前): {:?} 缺留痕 — 阻止退出并注入补写提醒。",
+                                            gaps_quiet
+                                        );
+                                        let _ = LAST_GATE_REMINDER.get_or_init(|| std::sync::Mutex::new(std::time::Instant::now())).lock().map(|mut t| *t = std::time::Instant::now());
+                                        let _ = codex_core::send_echo_notice(&gaps_quiet).await;
+                                        mesh_quiet_at = None;
+                                        continue;
+                                    }
+                                    // Reply-verdict gate (unified): check on EVERY
+                                    // exit path, not just fast-exit — unresolved
+                                    // NEEDS_FIX means the task isn't done.
+                                    let unresolved2 = codex_core::unresolved_negative_verdicts();
+                                    if !unresolved2.is_empty() {
+                                        codex_core::mark_degraded();
+                                        eprintln!(
+                                            "pulsing: 回复完整性(最终): {} 有未解决问题, 以降级完成收尾。",
+                                            unresolved2.join("、")
+                                        );
+                                    }
+                                    // Echo gate (final path): missing dispatch
+                                    // echoes at the last exit moment can no
+                                    // longer be repaired — record honestly.
+                                    let gaps_final = codex_core::echo_gaps();
+                                    if !gaps_final.is_empty() {
+                                        codex_core::mark_degraded();
+                                        eprintln!(
+                                            "pulsing: 留痕闸门(最终): {} 仍缺派单留痕, 以降级完成收尾。",
+                                            gaps_final.join("、")
+                                        );
+                                    }
+                                    if !codex_core::user_delivered() && ever_error {
+                                        codex_core::mark_exit_error();
+                                        eprintln!(
+                                            "pulsing: 未向用户交付任何结果而模型曾出错, 以失败退出。"
+                                        );
+                                    } else if !codex_core::user_delivered()
+                                        && codex_core::tasks_sent_total() == 0
+                                    {
+                                        // Run 2 scenario: nothing was dispatched,
+                                        // nothing was told to the user — this is a
+                                        // total failure, not a success.
+                                        codex_core::mark_exit_error();
+                                        eprintln!(
+                                            "pulsing: 未派活且未交付, 属于彻底失败, 以错误退出。"
+                                        );
+                                    } else if !codex_core::user_delivered() {
+                                        codex_core::mark_degraded();
+                                        eprintln!(
+                                            "pulsing: 未向用户交付最终报告, 以降级完成收尾。"
+                                        );
+                                    } else {
+                                        eprintln!("pulsing: 结果已交给用户，结束并关掉后台 Codex。");
+                                    }
+                                    let acceptance_failed =
+                                        matches!(codex_core::run_acceptance_check(), Some(false));
+                                    if acceptance_failed && !codex_core::degraded() {
+                                        codex_core::mark_degraded();
+                                    }
+                                    codex_core::ledger_exit(if codex_core::exit_error() || error_seen {
+                                        "error"
+                                    } else if codex_core::degraded() {
+                                        "degraded"
+                                    } else {
+                                        "complete"
+                                    });
                                     if let Err(err) = request_shutdown(
                                         &client,
                                         &mut request_ids,
@@ -1437,8 +1886,136 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                                 mesh_mailed = false;
                                 mesh_reply.clear();
                             } else {
+                                // Session-end path: an unresolved verdict at
+                                // stream end gets a bounded wake budget before
+                                // degrading — the model may have narrated
+                                // intent without acting (observed: judge
+                                // reported "unresolved issues" to the user
+                                // twice instead of 打回-ing, session ended,
+                                // run degraded). Mirror of the echo gate's
+                                // quiet-path block.
+                                if pulsing_wait
+                                    && !pulsing_child()
+                                    && codex_core::verdict_wakes() < 6
+                                {
+                                    let unresolved_se_wake =
+                                        codex_core::unresolved_negative_verdicts();
+                                    let draft_pending_se =
+                                        codex_core::pending_review();
+                                    // Progress resets the budget (mirror of
+                                    // the echo gate): a shrinking unresolved
+                                    // list means the judge is productively
+                                    // fixing; only a stagnant loop caps out.
+                                    // A newly registered draft clears verdicts
+                                    // (len drops to 0) — that is progress too.
+                                    if unresolved_se_wake.len() < last_unresolved
+                                        || (draft_pending_se && last_unresolved > 0)
+                                    {
+                                        codex_core::reset_verdict_wakes();
+                                    }
+                                    last_unresolved = unresolved_se_wake.len();
+                                    // Acceptance-failure wake (mirror of the
+                                    // fast-exit path): a failed mechanical
+                                    // check with budget left means the task
+                                    // isn't done — the session-end path used
+                                    // to degrade here even though the fix
+                                    // wake had JUST been injected and the
+                                    // repair turn was starting (stress-24
+                                    // 实锤: 唤醒 13:24:58 注入, 闸门
+                                    // 13:25:00 收尾, 修复回合被遗弃).
+                                    let acceptance_bad =
+                                        matches!(codex_core::run_acceptance_check(), Some(false));
+                                    if acceptance_bad {
+                                        codex_core::note_verdict_wake();
+                                        eprintln!(
+                                            "pulsing: 验收完整性(session-end阻断): 机械验收未通过 — 阻止退出并注入修复提醒。"
+                                        );
+                                        let _ = LAST_GATE_REMINDER.get_or_init(|| std::sync::Mutex::new(std::time::Instant::now())).lock().map(|mut t| *t = std::time::Instant::now());
+                                        let _ = codex_core::send_acceptance_notice().await;
+                                        continue;
+                                    }
+                                    if !unresolved_se_wake.is_empty() || draft_pending_se {
+                                        codex_core::note_verdict_wake();
+                                        if draft_pending_se && unresolved_se_wake.is_empty() {
+                                            eprintln!(
+                                                "pulsing: 回复完整性(session-end阻断): 新底稿已登记但尚未群发复审 — 阻止退出并注入复审提醒。"
+                                            );
+                                        } else {
+                                            eprintln!(
+                                                "pulsing: 回复完整性(session-end阻断): {} 未解决 — 阻止退出并注入打回提醒。",
+                                                unresolved_se_wake.join("、")
+                                            );
+                                        }
+                                        let _ = LAST_GATE_REMINDER.get_or_init(|| std::sync::Mutex::new(std::time::Instant::now())).lock().map(|mut t| *t = std::time::Instant::now());
+                                        let fix_arrived_se =
+                                            codex_core::writer_fix_arrived();
+                                        let notice_se = if draft_pending_se
+                                            && unresolved_se_wake.is_empty()
+                                        {
+                                            "锚点店已交回新版本底稿，当前版本尚未经过审查。\
+                                             请立即调用 fanout_task 群发复审最新底稿,\
+                                             不要只向用户描述情况。"
+                                                .to_string()
+                                        } else if fix_arrived_se {
+                                            format!(
+                                                "以下协作店的最新回信含未解决问题({}: {}。\n\
+                                                 writer 已交回修正版。请立即调用 fanout_task 重新群发复审,\
+                                                 不要只向用户描述情况。",
+                                                codex_core::negative_keyword(),
+                                                unresolved_se_wake.join("、")
+                                            )
+                                        } else {
+                                            format!(
+                                                "以下协作店的最新回信含未解决问题({}: {}。\n\
+                                                 请把他们的审查意见汇总后打回锚点店修复,\
+                                                 拿到修正版后调用 fanout_task 复审。不要只向用户描述情况。",
+                                                codex_core::negative_keyword(),
+                                                unresolved_se_wake.join("、")
+                                            )
+                                        };
+                                        let _ = codex_core::send_self_notice_text(&notice_se)
+                                            .await;
+                                        continue;
+                                    }
+                                }
+                                if codex_core::anchor_in_flight() {
+                                    // 打回在途: 退出会遗弃 writer 正在写的修正稿
+                                    // (mydemo2 实锤: degraded 收场而修正稿无处送)。
+                                    eprintln!(
+                                        "pulsing: 打回在途(锚点店未回), 不得收尾 — 等待修正稿"
+                                    );
+                                    continue;
+                                }
                                 if mesh_finished {
+                                    // Reply-verdict gate on session-end path too:
+                                    // all exit paths must check unresolved verdicts
+                                    // and un-reviewed drafts.
+                                    let unresolved_se = codex_core::unresolved_negative_verdicts();
+                                    if !unresolved_se.is_empty() {
+                                        codex_core::mark_degraded();
+                                        eprintln!(
+                                            "pulsing: 回复完整性(session-end): {} 有未解决问题, 降级收尾。",
+                                            unresolved_se.join("、")
+                                        );
+                                    } else if codex_core::pending_review() {
+                                        codex_core::mark_degraded();
+                                        eprintln!(
+                                            "pulsing: 回复完整性(session-end): 新底稿未经复审, 降级收尾。"
+                                        );
+                                    }
                                     eprintln!("pulsing: 结果已交给用户，结束并关掉后台 Codex。");
+                                    let acceptance_se =
+                                        matches!(codex_core::run_acceptance_check(), Some(false));
+                                    if acceptance_se && !codex_core::degraded() {
+                                        codex_core::mark_degraded();
+                                    }
+                                    codex_core::ledger_exit(if codex_core::exit_error() || error_seen {
+                                        "error"
+                                    } else if codex_core::degraded() {
+                                        "degraded"
+                                    } else {
+                                        "complete"
+                                    });
                                 }
                                 if let Err(err) = request_shutdown(
                                     &client,
@@ -1469,8 +2046,40 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         Err(_) => warn!("in-process app-server shutdown timed out"),
     }
     event_processor.print_final_output();
-    if error_seen {
+    // Degraded deliberately exits 0: the judge DID deliver an honest summary,
+    // and the demo launcher retries on non-zero, which would pointlessly
+    // re-run an already-delivered (if partial) outcome. The three-state
+    // Distinct exit codes: 0=complete, 1=error, 2=degraded.
+    // Zero dispatch OR zero review dispatch = failure: if the team has a
+    // review roster but not a single review shop was ever mailed, the
+    // review process never ran (observed: mesh bridging failure → judge
+    // mailed only writer → exited "complete" with zero reviews done).
+    if error_seen || codex_core::exit_error()
+        || codex_core::tasks_sent_total() == 0
+        || codex_core::review_dispatch_count() == 0
+    {
         std::process::exit(1);
+    }
+    // Final audit backstop: session-end paths can skip every gate block —
+    // never report success with a broken plaintext audit chain or an
+    // undelivered report (observed: judge woken for echo repair, re-sent
+    // letters instead, session ended with told_user=false and exit 0).
+    if pulsing_wait {
+        let residual_gaps = codex_core::echo_gaps();
+        if !residual_gaps.is_empty() {
+            eprintln!(
+                "pulsing: 留痕闸门(最终): {} 仍缺派单留痕, 以降级(degraded)退出。",
+                residual_gaps.join("、")
+            );
+            std::process::exit(2);
+        }
+        if !codex_core::user_delivered() {
+            eprintln!("pulsing: 最终报告从未交付给用户, 以降级(degraded)退出。");
+            std::process::exit(2);
+        }
+    }
+    if codex_core::degraded() {
+        std::process::exit(2);
     }
 
     Ok(())
@@ -2435,6 +3044,13 @@ fn prompt_with_stdin_context(prompt: &str, stdin_text: &str) -> String {
     combined
 }
 
+
+fn chronoless_stamp() -> String {
+    let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+    let secs = ms / 1000;
+    format!("[{:02}:{:02}:{:02}]", (secs/3600+8)%24, (secs/60)%60, secs%60)
+}
+
 fn note_mesh_turn(
     notification: &ServerNotification,
     told_user: &mut bool,
@@ -2448,7 +3064,15 @@ fn note_mesh_turn(
     };
     match item {
         AppServerThreadItem::AgentMessage { text, .. } if !text.trim().is_empty() => {
-            *told_user = true;
+            // Only ItemCompleted counts as a delivery: ItemStarted is the
+            // streaming prologue of the same message and will be superseded.
+            // Told-user semantics must match what print_final_output will
+            // actually emit (final_message), otherwise the exit gate claims
+            // deliveries stdout never carried (A05 bug).
+            // told_user is NO longer set here: any intermediate narration
+            // would qualify (A01-retry bug — judge announced dispatch and the
+            // immediate-exit path treated it as a delivery). Delivery is now
+            // decided at turn completion from final_message presence (below).
             reply.clear();
             reply.push_str(text);
         }

@@ -1,0 +1,95 @@
+@startuml
+autonumber
+skinparam NoteBackgroundColor #FFF3C8
+skinparam ActivationBackgroundColor #F8CE7A
+skinparam ArrowColor #444444
+skinparam ParticipantPadding 14
+skinparam BoxPadding 8
+
+actor "你" as U #FF7EB0
+box "Pulsing Mesh 集群 (loopback)" #F0F4FF
+  participant "judge\ncodex店" as J #C8F0DC
+  participant "writer\n:8102" as W #C5E3F5
+  participant "review-scaler\n:8103" as RS #DDD6F3
+  participant "review-duprow\n:8104" as RD #DDD6F3
+end box
+participant "watchdog\n(系统旁路,非codex)" as WD #EEEEEE
+
+U -> J : "写一个sklearn LogisticRegression训练脚本，\n切分train/test之前先做标准化"
+activate J
+note over J #C8F0DC
+  turn#1 输入 = harness 渲染的编排简报(固定模板)
+  · 这些Codex已按分工启动, 你的店名是codex
+  · 只用followup_task派活, target填店名
+  · 给审查员的信必须正文粘贴完整代码原文
+  · 有NEEDS_FIX就打回writer重写(最多3轮)
+  · 店名和职责: writer只写代码 /
+    scaler查切分前标准化 / duprow查drop_duplicates
+  · 用户的原话: <你输入的任务>
+end note
+
+J -> W : 信1 followup_task\n{from_shop:"codex", to_shop:"writer",\nbody:"任务:写sklearn…写完把完整脚本放进回信",\ntrigger_turn:true}
+activate W
+W --> J : DeliverAck{ok:true}
+note right of J #FFE2E2
+  台账 pending=1
+  工具结果"delivered via pulsing to shops/writer"
+end note
+
+note over W #FFF3C8
+  注入上下文 = 前言 + 正文:
+  "[pulsing codex] 回信target填codex"
+  (harness手写, 教回信地址)
+  + writer的role + 信1正文
+end note
+W -> W : gpt-5.6-luna 生成脚本\n(workspace-write沙箱)
+W --> J : 信2 回信 {from_shop:"writer",\nto_shop:"codex", body:"<完整Python脚本原文>",\ntrigger_turn:true}
+deactivate W
+note right of J
+  台账 pending(writer)=0
+  judge turn#2 开
+end note
+
+J -> RS : 信3 {to_shop:"review-scaler",\nbody:"<脚本原文>", trigger_turn:true}
+activate RS
+J -> RD : 信4 {to_shop:"review-duprow",\nbody:"<脚本原文>", trigger_turn:true}
+activate RD
+note right of J #FFE2E2
+  台账 pending=2
+end note
+
+RS --> J : 信5 "CLEAN" 或 "NEEDS_FIX:\n<位置>;切分前未标准化;<原因>;<一句建议>"
+deactivate RS
+RD --> J : 信6 "CLEAN" 或 "NEEDS_FIX:\n未调用drop_duplicates…"
+deactivate RD
+
+alt 存在 NEEDS_FIX
+  J -> W : 信7 打回: <脚本> + <审查意见>
+  activate W
+  W --> J : 改写后的完整脚本
+  deactivate W
+  note over J
+    再分发盲审
+    (店规上限: 打回3轮, 之后如实说明分歧)
+  end note
+end alt
+
+J --> U : "任务完成: 脚本如下…各店结论…\n(中文汇总)"
+note over J #C8F0DC
+  台账=0 + 静默期满 → exit gate 放行
+  逐店 shutdown wire, worker子进程回收
+end note
+deactivate J
+
+== 旁路: watchdog (240s无回信自动催办, 不经judge决策) ==
+WD -> W : nudge信 {trigger_turn:true}\n(240s无回信, 最多3次)
+WD -> J : 3次耗尽: 台账删项 + 自通知\n"<shop>多次催办仍无回信，已放弃等待。\n请汇总现有结论并收尾。"
+note over J, RD #FFF3C8
+  消息格式 InterAgentWire (peer.rs:8):
+  from_shop / to_shop / body /
+  trigger_turn(true=收方必须开新turn) /
+  encrypted(API侧加密) / shutdown(退网)
+  店规红线: 回信只能用followup_task /
+  审查信必须贴代码原文 / 最多打回3轮 / 最终中文汇总
+end note
+@enduml

@@ -243,6 +243,22 @@ pub fn create_followup_task_tool() -> ToolSpec {
     })
 }
 
+pub fn create_fanout_task_tool() -> ToolSpec {
+    // Zero parameters by design: the machine enumerates recipients from the
+    // team config and embeds the anchor shop's latest script verbatim. The
+    // model only decides WHEN to fan out — coverage and verbatim integrity
+    // are structural, not behavioral.
+    ToolSpec::Function(ResponsesApiTool {
+        name: "fanout_task".to_string(),
+        description: "Fan out the review round to ALL review shops in one call: each shop automatically receives one letter containing your instruction template plus the writer's latest script embedded VERBATIM (the script is copied by the system from the writer's reply, never retyped). Requires the writer's latest reply to have arrived (the script baseline must be registered). Do NOT use followup_task to send review letters shop by shop — use this tool once per review round. Delivery results are reported back per shop and logged in plaintext."
+            .to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::object(BTreeMap::new(), Some(vec![]), Some(false.into())),
+        output_schema: None,
+    })
+}
+
 pub fn create_resume_agent_tool() -> ToolSpec {
     let properties = BTreeMap::from([(
         "id".to_string(),

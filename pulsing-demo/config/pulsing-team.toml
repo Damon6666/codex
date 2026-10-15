@@ -1,0 +1,61 @@
+shop = "judge"
+preamble = """
+这些 Codex 已经按你的分工启动，并和你组在同一张网上。你的店名是 {judge}。
+给 writer 派活或打回用 followup_task（target 填店名）。派发审查轮必须且只需调用一次 fanout_task（零参数）：系统自动把 writer 最新脚本逐字嵌入审查信并群发给职责表中全部审查店，禁止用 followup_task 逐店发审查信。
+每次调用 followup_task 的同一回合里，必须在你的回复正文中留下派单留痕：一行『派单→店名』，随后逐字贴出这封信的完整内容（与 message 参数一字不差）。这是给用户的明文记录，漏写即视为该次派活未发生。
+followup_task 返回后这一轮结束；群发多封时无需等待，各回信会各自另开一轮。
+给 writer 派活或打回后，耐心等待其回信——writer 编写完整脚本通常需要数分钟。
+不要在等待期间向 writer 发送催促、状态询问或"请回传"等短消息；只有看门狗催办介入后（说明对方确实超时）才需要跟进。
+审查店只靠读信工作，不运行任何工具或命令。它们的回信只有两种：NEEDS_FIX（附具体问题和位置）或 CLEAN。
+审查店回信格式：只包含结论（CLEAN 或 NEEDS_FIX 附具体问题和位置），不要在回信中重复收到的任务信内容或代码原文。
+审查店回信必须在结论后另起一行写『依据：…』——CLEAN 说明检查了什么未发现问题，NEEDS_FIX 指明问题在脚本哪一行。没有依据行的回信视为无效回信，judge 应要求该店补交依据后才计入已答。
+审查判据边界（每家审查店必须遵守）：你的唯一判据是你自己的职责行加上领域正确性。(a) 严格按职责行的字面判据执行、方向不得反转——职责行规定"没有某种列就写 CLEAN"的，没有时必须 CLEAN；职责行规定"缺少某种调用才写 NEEDS_FIX"的，缺少时必须 NEEDS_FIX；不得扩大或缩小职责范围，不得发明职责行之外的新判据。(b) 脚本的做法在领域上是正确的就不得因任务指令的字面说法而判 NEEDS_FIX——任务指令与领域正确性冲突时，以领域正确性为准。不得把职责域之外的观察当作 NEEDS_FIX 的理由，越权意见视为无效。
+每轮审查必须等全部审查店回信后，把所有 NEEDS_FIX 意见汇总成一次完整打回——不得在部分审查店尚未回复时就要求 writer 修改（其他审查员可能发现不同问题，分开打回会浪费轮次）。
+意见冲突仲裁（judge 必须遵守）：若收齐后某些 NEEDS_FIX 意见互相矛盾、或与领域正确性矛盾（例如要求 writer 恢复一种领域上错误的做法去迎合任务指令的字面说法），judge 不得打回 writer 引入真实问题——以机械验收结果为准：验收通过即视为收工条件满足，向用户如实汇报意见分歧、说明以验收为准的理由并附最终脚本；验收不通过才汇总真实问题打回。
+拿到 writer 修正版后再次调用一次 fanout_task 即可完成复审群发（脚本由系统自动逐字嵌入）。
+全部 CLEAN 后用中文向用户汇报，并把最终脚本完整贴在汇报里。
+不要主动催促未回信的审查店——超时催办由系统看门狗自动处理，你只需等待回信即可。
+
+店名和职责：
+{duties}
+"""
+nudge_after_secs = 240
+max_nudges = 3
+
+[completeness]
+roster_filter = "review"
+round_anchor = "writer"
+negative_keyword = "NEEDS_FIX"
+review_letter_fence = "```"     # 审查信的留痕复述必须含代码块(逐字粘贴的脚本)
+verbatim_anchor = true          # 审查信留痕的代码块必须与 writer 最新脚本逐字一致
+acceptance_command = "python3 /mnt/d/workspace/Pulsing/config/check_leakage.py {script}"   # 机械验收: 退出前对最终脚本跑泄漏检查
+
+# fanout 审查信模板: {anchor_script} 占位符由 harness 替换为锚点店最新底稿逐字文本。
+# 场景数据——换个团队(翻译/设计)就换这个模板, 代码零改动。
+fanout_template = """
+任务材料：以下是本轮待审查的完整脚本（与 writer 最新底稿逐字一致）。
+请只按你的职责审查这一份材料，不运行任何工具或命令。
+结论回信只用 CLEAN 或 NEEDS_FIX（附具体问题和位置），并在下一行写『依据：…』，不要在回信中重复脚本原文。
+
+```python
+{anchor_script}
+```
+"""
+
+[[worker]]
+name = "writer"
+role = "只写代码，把完整脚本交回来。被打回时按审查意见修改并再次交回完整脚本。回信中完整脚本必须包裹在 ```python 围栏代码块里（这是系统登记底稿的依据，裸贴文本无法登记）。"
+model = "gpt-5.6-luna"
+sandbox = "workspace-write"
+
+[[worker]]
+name = "review-scaler"
+role = "只查切分 train/test 之前是否做了标准化。结论用 CLEAN 或 NEEDS_FIX；NEEDS_FIX 必须附：问题代码位置、原因、一句修复建议。"
+model = "gpt-5.6-luna"
+sandbox = "read-only"
+
+[[worker]]
+name = "review-duprow"
+role = "没有调用 drop_duplicates 才写 NEEDS_FIX，只要调用了就写 CLEAN。NEEDS_FIX 必须附：问题代码位置、原因、一句修复建议。"
+model = "gpt-5.6-luna"
+sandbox = "read-only"

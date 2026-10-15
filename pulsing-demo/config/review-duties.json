@@ -1,0 +1,11 @@
+{
+  "_comment": "审查店职责词表(场景数据) — deep-audit 越权观察项的数据源。换团队只改本文件。",
+  "review_rowleak": ["行", "重复", "train", "test", "切分", "同现", "泄漏", "样本"],
+  "review_featsel": ["特征", "选择", "fit", "切分", "训练集", "选择器"],
+  "review_impute": ["填充", "imputer", "缺失", "fit", "拟合", "训练集"],
+  "review_temporal": ["时间", "日期", "temporal", "列"],
+  "review_group": ["分组", "group", "列", "分层"],
+  "review_scaler": ["标准化", "scaler", "StandardScaler", "fit", "拟合", "训练集"],
+  "review_target": ["target", "标签", "y", "去重", "切分"],
+  "review_duprow": ["去重", "drop_duplicates", "重复", "切分"]
+}

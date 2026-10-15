@@ -43,6 +43,7 @@ use crate::tools::handlers::multi_agents_common::MIN_WAIT_TIMEOUT_MS;
 use crate::tools::handlers::multi_agents_spec::MULTI_AGENT_V1_NAMESPACE;
 use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_spec::WaitAgentTimeoutOptions;
+use crate::tools::handlers::multi_agents_v2::FanoutTaskHandler as FanoutTaskHandlerV2;
 use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTaskHandlerV2;
 use crate::tools::handlers::multi_agents_v2::InterruptAgentHandler;
 use crate::tools::handlers::multi_agents_v2::ListAgentsHandler as ListAgentsHandlerV2;
@@ -1301,6 +1302,20 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, registry: &mut Too
                     tool_namespace,
                     model_messages.multi_agent_tool_description_override("followup_task"),
                     model_messages.multi_agent_tool_parameters_override("followup_task"),
+                ),
+                exposure,
+            );
+            registry.register_trusted_with_exposure(
+                // Plain function tool — deliberately NOT wrapped in the
+                // multi-agent reserved namespace: the API allowlists only
+                // known names there ('collaboration.fanout_task' is rejected
+                // server-side). Outside the reserved namespace any function
+                // name is accepted.
+                multi_agent_v2_handler(
+                    FanoutTaskHandlerV2,
+                    None,
+                    model_messages.multi_agent_tool_description_override("fanout_task"),
+                    model_messages.multi_agent_tool_parameters_override("fanout_task"),
                 ),
                 exposure,
             );

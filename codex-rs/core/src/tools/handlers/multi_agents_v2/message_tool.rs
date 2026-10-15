@@ -68,6 +68,16 @@ pub(super) async fn handle_message_string_tool(
                 )
                 .await
                     .map_err(|remote| {
+                        // Structured record for the monitoring blind spot:
+                        // tool errors otherwise live only in stderr tracing,
+                        // and turn_end keeps reporting error_seen=false.
+                        crate::pulsing::emit_event(
+                            "tool_error",
+                            serde_json::json!({
+                                "tool": "followup_task", "target": target,
+                                "error": format!("{err}; pulsing: {remote}"),
+                            }),
+                        );
                         FunctionCallError::RespondToModel(format!("{err}; pulsing: {remote}"))
                     });
             }
