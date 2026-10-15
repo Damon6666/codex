@@ -1,3 +1,10 @@
+> [!NOTE]
+> **This is the `v0demo` branch — Pulsing 多 Codex 协作演示。**
+> 在 Codex CLI 上嵌入 Pulsing 分布式 actor mesh：10 个 codex 实例跨机（Windows judge + pjlab Linux workers）
+> 协作完成"派单 → 写码 → 8 店审查 → 打回修复 → 机械验收 → 交付"全流程，全程可观测（实时时序图 / 明文账本 / 马拉松验收）。
+> **入口：[`pulsing-demo/README.md`](pulsing-demo/README.md)**（分层说明、快速开始、关键机制）。
+> 以下为上游 Codex CLI 原版说明。
+
 <p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
 <p align="center">
   <img src="https://github.com/openai/codex/blob/main/.github/codex-cli-splash.png" alt="Codex CLI splash" width="80%" />
