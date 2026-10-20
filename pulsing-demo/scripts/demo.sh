@@ -11,14 +11,26 @@
 #   bash demo.sh view tag          ← demo 跑完后回顾全场
 #   bash demo.sh finalize tag      ← 手动补齐档案(拉远程+双日志+时序图)
 #                                  (go 成功后已自动执行, 通常无需手动)
-BASE=/mnt/d/workspace/Pulsing
+# 仓库自定位: 本脚本位于 <repo>/pulsing-demo/scripts/ → BASE=pulsing-demo
+BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$BASE/.." && pwd)"
 # ── 部署参数(换环境只改这里) ── 跨机 worker 的 tmux 会话名
 REMOTE_TMUX="xw-review_scaler xw-review_target xw-review_duprow"
 TAG="${2:?用法: demo.sh go|single|watch|view <tag>}"
 DIR="$BASE/demo/$TAG"
-CODEX="$HOME/bin/codex"
-[ -x "$CODEX" ] || CODEX=/mnt/d/workspace/Pusling/Codex/codex-rs/target/release/codex-linux-stripped
-export https_proxy=http://127.0.0.1:7897 HTTPS_PROXY=http://127.0.0.1:7897
+CODEX="${CODEX_BIN:-}"
+[ -x "$CODEX" ] || CODEX="$REPO_ROOT/codex-rs/target/release/codex"
+[ -x "$CODEX" ] || CODEX="$HOME/bin/codex"
+if [ ! -x "$CODEX" ]; then
+  echo "[demo] ✗ 未找到 codex 二进制。请先构建:"
+  echo "       cd codex-rs && cargo build --release -p codex-cli"
+  echo "       (或用环境变量 CODEX_BIN 指定已构建的二进制路径)"
+  exit 1
+fi
+# 代理仅在本机 7897(clash 等)实际可达时才挂 — 无代理环境直连, 不再无条件断网
+if timeout 1 bash -c 'echo > /dev/tcp/127.0.0.1/7897' 2>/dev/null; then
+  export https_proxy=http://127.0.0.1:7897 HTTPS_PROXY=http://127.0.0.1:7897
+fi
 
 
 # 杀旧隧道后 Windows 侧端口释放有数秒延迟, 立即重建会 bind 失败
@@ -74,9 +86,9 @@ sys.exit(0 if ok else 1)
 PYSEG
       then SEG=$seg; break; fi
     done
-    RUNTIME_TOML=/mnt/d/workspace/Pulsing/config/pulsing-cross-runtime.toml
+    RUNTIME_TOML="$BASE/config/pulsing-cross-runtime.toml"
     if [ -n "$SEG" ]; then
-      sed -e "s/127.0.0.1:15201/127.0.0.1:${SEG}/"           -e "s/127.0.0.1:15202/127.0.0.1:$((SEG+1))/"           -e "s/127.0.0.1:15203/127.0.0.1:$((SEG+2))/"           /mnt/d/workspace/Pulsing/config/pulsing-cross.toml > "$RUNTIME_TOML"
+      sed -e "s/127.0.0.1:15201/127.0.0.1:${SEG}/"           -e "s/127.0.0.1:15202/127.0.0.1:$((SEG+1))/"           -e "s/127.0.0.1:15203/127.0.0.1:$((SEG+2))/"           "$BASE/config/pulsing-cross.toml" > "$RUNTIME_TOML"
       if [ "$SEG" != "15201" ]; then
         export CODEX_PULSING_RUNTIME_SEG=$SEG
         echo "[demo] 1520x 段被幽灵端口占用 — 自动换段到 ${SEG}x(运行时 toml 已生成)"
@@ -87,7 +99,7 @@ PYSEG
     fi
     # ③ 演示保险丝: 降级标记存在时直接跑本机 toml
     if [ -n "${CODEX_PULSING_FALLBACK_LOCAL:-}" ]; then
-      exec env CODEX_PULSING_TEAM=/mnt/d/workspace/Pulsing/config/pulsing-team.toml         bash /mnt/d/workspace/Pulsing/scripts/run-cross-demo-linux.sh "$TAG-local"
+      exec env CODEX_PULSING_TEAM="$BASE/config/pulsing-team.toml" bash "$BASE/scripts/run-cross-demo-linux.sh" "$TAG-local"
     fi
 
     # 轮前清档: 同 tag 重跑时旧档案会让 watch/时序图把上一轮事件和本轮
@@ -169,7 +181,7 @@ PYSEG
   done
   if [ "$TUNNEL_OK" -ne 1 ]; then
     echo "[demo] ✗ 隧道 4 轮重建仍不通 — 降级本机模式保演示"
-    exec env CODEX_PULSING_TEAM=/mnt/d/workspace/Pulsing/config/pulsing-team.toml       bash /mnt/d/workspace/Pulsing/scripts/run-cross-demo-linux.sh "$TAG-local"
+    exec env CODEX_PULSING_TEAM="$BASE/config/pulsing-team.toml" bash "$BASE/scripts/run-cross-demo-linux.sh" "$TAG-local"
   fi
 
   # 辅隧道: pjlab 本地 8101 → judge。worker 的 seed 连接(9101)瞬断后,
@@ -213,7 +225,15 @@ PYSEG
     cd "$BASE/config"
     exec env CODEX_PULSING_TEAM="$BASE/config/pulsing-team.toml" \
       CODEX_PULSING_LOG_DIR="$DIR" \
-      "$CODEX" -c 'model="gpt-5.6-luna"' \
+      "$CODEX" -c "model=\"${CODEX_DEMO_MODEL:-gpt-5.6-luna}\"" \
+      '写一个 sklearn 的 LogisticRegression 训练脚本，并且在切分 train/test 之前先对特征做标准化。有 NEEDS_FIX 就打回写代码的那个重写，全部 CLEAN 后用中文汇报。'
+    ;;
+  single10)
+    mkdir -p "$DIR"
+    cd "$BASE/config"
+    exec env CODEX_PULSING_TEAM="$BASE/config/pulsing-single10.toml" \
+      CODEX_PULSING_LOG_DIR="$DIR" \
+      "$CODEX" -c "model=\"${CODEX_DEMO_MODEL:-gpt-5.6-luna}\"" \
       '写一个 sklearn 的 LogisticRegression 训练脚本，并且在切分 train/test 之前先对特征做标准化。有 NEEDS_FIX 就打回写代码的那个重写，全部 CLEAN 后用中文汇报。'
     ;;
   watch)
@@ -232,11 +252,11 @@ for path in glob.glob(sys.argv[1] + "/events-judge.jsonl"):
 print(ts if ts else time.strftime("%H:%M"))
 PYEOF
 )
-    exec python3 "$BASE/tools/scale/watch-all.py" "$DIR" --since "$SINCE" "${@:3}" ;;
+    exec python3 "$BASE/tools/watch-all.py" "$DIR" --since "$SINCE" "${@:3}" ;;
   view)
-    exec python3 "$BASE/tools/scale/view-all-events.py" "$DIR" ;;
+    exec python3 "$BASE/tools/view-all-events.py" "$DIR" ;;
   finalize)
     exec bash "$BASE/scripts/finalize-demo.sh" "$DIR" ;;
   *)
-    echo "用法: demo.sh go|single|watch|view <tag>" >&2; exit 1 ;;
+    echo "用法: demo.sh single|single10|go|watch|view|finalize <tag>  (新用户从 single 开始)" >&2; exit 1 ;;
 esac
