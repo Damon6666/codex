@@ -1,8 +1,32 @@
 > [!NOTE]
 > **This is the `v0demo` branch — Pulsing 多 Codex 协作演示。**
-> 在 Codex CLI 上嵌入 Pulsing 分布式 actor mesh：10 个 codex 实例跨机（Windows judge + pjlab Linux workers）
-> 协作完成"派单 → 写码 → 8 店审查 → 打回修复 → 机械验收 → 交付"全流程，全程可观测（实时时序图 / 明文账本 / 马拉松验收）。
-> **入口：[`pulsing-demo/README.md`](pulsing-demo/README.md)**（分层说明、快速开始、关键机制）。
+> 在 Codex CLI 上嵌入 Pulsing 分布式 actor mesh：10 个 codex 实例协作完成
+> "派单 → 写码 → 8 店审查 → 打回修复 → 机械验收 → 交付"全流程，全程可观测（实时时序图 / 明文账本 / 马拉松验收）。
+>
+> ## 拉下来就能跑（Linux / WSL，已实测）
+>
+> 前置只有两个：**Rust 工具链** + **模型接入**（`codex login`，或在 `~/.codex/config.toml` 配任意 OpenAI 兼容端点）。
+>
+> ```bash
+> # 1. 克隆（--recursive 会自动拉取内核 submodule）
+> git clone --recursive -b v0demo https://github.com/Damon6666/codex.git codex-demo
+> cd codex-demo/pulsing-demo
+>
+> # 2. 构建（一次性，约 10-30 分钟；产物 demo.sh 会自动找到）
+> cd ../codex-rs && cargo build --release -p codex-cli && cd ../pulsing-demo
+>
+> # 3. 跑单机 10-codex demo（无需第二台机器/隧道/代理）
+> bash scripts/demo.sh single10 mydemo
+>
+> # 另开一个窗口：实时全场日志+时序图（浏览器 http://localhost:8765）
+> bash scripts/demo.sh watch mydemo
+> ```
+>
+> 正常约 5 分钟走完全流程并自动退出（事件账本落在 `demo/<tag>/`）。
+> 最小验证可先用 `bash scripts/demo.sh single mydemo`（3-codex）。
+> **自建模型网关的用户必读**：模型名保持 `gpt-5.6-luna`、在网关侧映射到实际后端（陌生模型名会降级 fork 的工具调用）。
+> 详细说明（分层/机制/跨机进阶/常见问题）：**[pulsing-demo/README.md](pulsing-demo/README.md)**
+>
 > 以下为上游 Codex CLI 原版说明。
 
 <p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
