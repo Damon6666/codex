@@ -40,8 +40,8 @@ codex-pulsing 二进制（见下）。模型默认 `glm-5.3`（`MODEL=xxx ./run.
 
 | 剧本 | 用法 | 轮数 | 特点 |
 |---|---|---|---|
-| **validate**（默认） | `TEAM=team-single10-validate.toml` | 恒 1 轮 | 注册校验函数审查；5 轮压测 22/22×5 满分，90-270 秒稳定收尾，**展厅保底** |
-| **fixloop** | `TEAM=team-single10-fixloop.toml` | 2-4 轮 | 任务故意少写两条领域标准约束，审查店精准抓漏 → 打回 → 修正 → 复审；带防刷屏纪律（每轮唯一一封打回信） |
+| **validate** | `TEAM=team-single10-validate.toml` | 恒 1 轮 | 注册校验函数审查；5 轮压测 22/22×5 满分，90-270 秒稳定收尾，**展厅保底** |
+| **fixloop**（默认） | `TEAM=team-single10-fixloop.toml`（不设 TEAM 即此剧本） | 2-4 轮 | 任务故意少写两条领域标准约束，审查店精准抓漏 → 打回 → 修正 → 复审；带防刷屏纪律（每轮唯一一封打回信） |
 | **loop** | `TEAM=team-single10-loop.toml` | 1-5 轮 | 埋雷剧本（第二行只准纯数字），戏剧性强 |
 | greeting | `TEAM=team-single10.toml` | 恒 1 轮 | 极简问候脚本，最短路径 |
 

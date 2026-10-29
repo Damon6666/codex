@@ -11,7 +11,7 @@ RUN_DIR="$HERE/runs/run-$RUN_ID"
 SHIM_PORT="${SHIM_PORT:-4012}"
 TIMEOUT_MIN="${TIMEOUT_MIN:-14}"
 MODEL="${MODEL:-glm-5.3}"
-TEAM="${TEAM:-$HERE/team-single10.toml}"
+TEAM="${TEAM:-$HERE/team-single10-fixloop.toml}"
 STAMP() { date +%H:%M:%S; }
 
 # ───────────────────────── 1. 环境自检(全部 fail-fast) ─────────────────────────
