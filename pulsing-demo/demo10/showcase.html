@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>10-Codex 写审协作 Demo — 实况回放</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e17;color:#e0e6ed;font-family:'SF Mono',Consolas,'Microsoft YaHei',monospace;padding:24px}
+h1{color:#64ffda;font-size:22px;margin-bottom:4px}
+.sub{color:#546e8a;font-size:12px;margin-bottom:18px}
+.card{background:#111a2e;border:1px solid #1e2d3d;border-radius:12px;padding:16px;margin-bottom:16px}
+.card h2{color:#64ffda;font-size:15px;margin-bottom:8px}
+img.anim{width:100%;border-radius:8px;border:1px solid #1e3a5f}
+table{border-collapse:collapse;width:100%;font-size:13px}
+td,th{border:1px solid #1e2d3d;padding:6px 10px;text-align:left}
+th{color:#64ffda}
+.tm{color:#39d98a}.nf{color:#ff5c5c}.jd{color:#4dc9ff}.fo{color:#ffb347}
+a{color:#4dc9ff}
+</style>
+</head>
+<body>
+<h1>10 个 Codex 的写审协作 — 实况回放</h1>
+<div class="sub">1 judge（指挥）+ 1 writer（写码）+ 8 审查店 · pulsing mesh 通信 · 以下动画由真实运行的事件账本自动生成（非示意）</div>
+
+<div class="card">
+<h2>通信实况动画（run-1029-154714 · 台式机 WSL · glm-5.3）</h2>
+<img class="anim" src="assets/demo10-animation.gif" alt="sequence animation">
+</div>
+
+<div class="card">
+<h2>这一轮发生了什么</h2>
+<table>
+<tr><th>时刻</th><th>事件</th></tr>
+<tr><td>15:47:17</td><td class="jd">judge 收到任务，10 节点组网完成</td></tr>
+<tr><td>15:47:34</td><td class="jd">judge → writer：派单（任务原文一字不改转发）</td></tr>
+<tr><td>15:47:44</td><td class="fo">writer 交回 validate() 函数稿 → 系统登记底稿 → fanout 同刻群发 8 家审查店</td></tr>
+<tr><td>15:47:5x</td><td><span class="tm">6 家 CLEAN</span> · <span class="nf">review_special / review_diff 抓漏：缺"特殊字符检查"与"密码≠用户名"</span></td></tr>
+<tr><td>15:48:53</td><td class="jd">judge → writer：汇总打回（每轮唯一一封，防刷屏纪律）</td></tr>
+<tr><td>15:49:30</td><td class="fo">writer 交修正稿 → 二次 fanout 复审</td></tr>
+<tr><td>15:51</td><td>收尾（本轮在最终汇报时遇模型调用悬挂，进程硬退出——通信层 29/29 审计满分）</td></tr>
+</table>
+</div>
+
+<div class="card">
+<h2>自己跑一遍</h2>
+<pre style="color:#9fb8d0;line-height:1.8">git clone -b demo_review https://github.com/Damon6666/codex.git
+cd codex/pulsing-demo/demo10
+export ZHIPU_API_KEY=&lt;你的key&gt;
+./run.sh        # 自动: 环境自检→网关→10 codex→时序图→22项通信审计</pre>
+<div style="margin-top:8px;font-size:12px;color:#546e8a">详细文档见 <a href="README.md">README</a> · 三个剧本：validate（默认）/ fixloop（打回攻防）/ sklearn（数据泄漏深剧场）</div>
+</div>
+</body>
+</html>
