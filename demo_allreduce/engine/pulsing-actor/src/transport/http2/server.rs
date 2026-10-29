@@ -1,0 +1,1014 @@
+//! HTTP/2 server implementation.
+
+use super::config::Http2Config;
+use super::stream::{BinaryFrameParser, StreamFrame};
+use super::{headers, MessageMode, RequestType};
+use crate::actor::{max_tensor_wire_bytes, Message, TensorMessage, TENSOR_MESSAGE_TYPE};
+use crate::error::{PulsingError, Result, RuntimeError};
+use crate::tracing::{OpenTelemetrySpanExt, TraceContext, TRACEPARENT_HEADER, TRACESTATE_HEADER};
+use crate::transport::tensor::{
+    raw_tensor_transport_requested, read_raw_tensor_frame, record_raw_tensor_connection,
+    write_raw_tensor_frame, RawTensorKind, RAW_TENSOR_MAGIC,
+};
+use bytes::Bytes;
+use futures::StreamExt;
+use http_body_util::{BodyExt, Full, Limited, StreamBody};
+use hyper::body::{Frame, Incoming};
+use hyper::server::conn::http2;
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode};
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use std::convert::Infallible;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
+
+/// Handler trait for HTTP/2 server.
+#[async_trait::async_trait]
+pub trait Http2ServerHandler: Send + Sync + 'static {
+    /// Unified message handler.
+    async fn handle_message_full(&self, path: &str, msg: Message) -> Result<Message> {
+        match msg {
+            Message::Single { msg_type, data } => {
+                self.handle_message_simple(path, &msg_type, data).await
+            }
+            Message::Stream { .. } => Err(PulsingError::from(RuntimeError::Other(
+                "Streaming requests not supported by this handler".into(),
+            ))),
+            Message::Tensor(_) => Err(PulsingError::from(RuntimeError::Other(
+                "Tensor requests not supported by this handler".into(),
+            ))),
+        }
+    }
+
+    /// Simple message handler.
+    async fn handle_message_simple(
+        &self,
+        path: &str,
+        msg_type: &str,
+        payload: Vec<u8>,
+    ) -> Result<Message> {
+        let _ = (path, msg_type, payload);
+        Err(PulsingError::from(RuntimeError::Other(
+            "Not implemented".into(),
+        )))
+    }
+
+    /// Handle tell (fire-and-forget) message.
+    async fn handle_tell(&self, path: &str, msg_type: &str, payload: Vec<u8>) -> Result<()>;
+
+    /// Unified tell handler. Implementations which route arbitrary actor
+    /// messages should override this to preserve TensorMessage buffers.
+    async fn handle_tell_full(&self, path: &str, msg: Message) -> Result<()> {
+        match msg {
+            Message::Single { msg_type, data } => self.handle_tell(path, &msg_type, data).await,
+            Message::Stream { .. } => Err(PulsingError::from(RuntimeError::Other(
+                "Streaming requests not supported for tell".into(),
+            ))),
+            Message::Tensor(_) => Err(PulsingError::from(RuntimeError::Other(
+                "Tensor requests not supported for tell by this handler".into(),
+            ))),
+        }
+    }
+
+    /// Handle gossip message.
+    async fn handle_gossip(
+        &self,
+        payload: Vec<u8>,
+        peer_addr: SocketAddr,
+    ) -> Result<Option<Vec<u8>>>;
+
+    /// Get health status.
+    async fn health_check(&self) -> serde_json::Value {
+        serde_json::json!({"status": "ok"})
+    }
+
+    /// Get Prometheus metrics (text format).
+    async fn prometheus_metrics(&self) -> String {
+        String::new()
+    }
+
+    /// Get cluster members list.
+    async fn cluster_members(&self) -> serde_json::Value {
+        serde_json::json!([])
+    }
+
+    /// Get actors list on this node.
+    async fn actors_list(&self, include_internal: bool) -> serde_json::Value {
+        let _ = include_internal;
+        serde_json::json!([])
+    }
+
+    /// Handle client resolve request (out-cluster).
+    async fn handle_client_resolve(&self, path: &str) -> serde_json::Value {
+        let _ = path;
+        serde_json::json!({"found": false, "path": path, "gateway": "", "instance_count": 0})
+    }
+
+    /// Handle client members request (out-cluster).
+    async fn handle_client_members(&self) -> serde_json::Value {
+        serde_json::json!({"gateways": []})
+    }
+
+    /// Get as Any for downcasting.
+    fn as_any(&self) -> &dyn std::any::Any;
+
+    /// Handle head node API requests.
+    async fn handle_head_api(
+        &self,
+        _path: &str,
+        _method: &str,
+        _body: Vec<u8>,
+    ) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+}
+
+/// HTTP/2 Server.
+pub struct Http2Server {
+    local_addr: SocketAddr,
+    cancel: CancellationToken,
+}
+
+impl Http2Server {
+    pub async fn new(
+        bind_addr: SocketAddr,
+        handler: Arc<dyn Http2ServerHandler>,
+        config: Http2Config,
+        cancel: CancellationToken,
+    ) -> Result<Self> {
+        let listener = TcpListener::bind(bind_addr)
+            .await
+            .map_err(|e| PulsingError::from(RuntimeError::Other(e.to_string())))?;
+        let local_addr = listener
+            .local_addr()
+            .map_err(|e| PulsingError::from(RuntimeError::Other(e.to_string())))?;
+
+        tracing::info!(addr = %local_addr, "Starting HTTP/2 server");
+
+        let server_cancel = cancel.clone();
+        tokio::spawn(async move {
+            Self::run_server(listener, handler, config, server_cancel).await;
+        });
+
+        Ok(Self { local_addr, cancel })
+    }
+
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    pub fn shutdown(&self) {
+        self.cancel.cancel();
+    }
+
+    async fn run_server(
+        listener: TcpListener,
+        handler: Arc<dyn Http2ServerHandler>,
+        config: Http2Config,
+        cancel: CancellationToken,
+    ) {
+        loop {
+            tokio::select! {
+                result = listener.accept() => {
+                    match result {
+                        Ok((stream, peer_addr)) => {
+                            let handler = handler.clone();
+                            let config = config.clone();
+                            let conn_cancel = cancel.clone();
+
+                            tokio::spawn(async move {
+                                if let Err(e) = Self::handle_connection(
+                                    stream,
+                                    peer_addr,
+                                    handler,
+                                    config,
+                                    conn_cancel,
+                                ).await {
+                                    tracing::debug!(
+                                        peer = %peer_addr,
+                                        error = %e,
+                                        "Connection error"
+                                    );
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "Accept error");
+                        }
+                    }
+                }
+                _ = cancel.cancelled() => {
+                    tracing::info!("HTTP/2 server shutting down");
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Handle a single connection
+    async fn handle_connection(
+        stream: tokio::net::TcpStream,
+        peer_addr: SocketAddr,
+        handler: Arc<dyn Http2ServerHandler>,
+        config: Http2Config,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<()> {
+        // Check if TLS is enabled
+        #[cfg(feature = "tls")]
+        if let Some(ref tls_config) = config.tls {
+            // TLS mode: accept TLS handshake first
+            let tls_stream = tls_config
+                .accept(stream)
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let io = TokioIo::new(tls_stream);
+
+            // TLS connections always use HTTP/2 (no HTTP/1.1 fallback)
+            return Self::serve_h2_generic(io, peer_addr, handler, config, cancel).await;
+        }
+
+        if raw_tensor_transport_requested()
+            && Self::is_raw_tensor_connection(&stream, config.connect_timeout).await?
+        {
+            return Self::serve_raw_tensor(stream, peer_addr, handler, cancel).await;
+        }
+
+        // Plain TCP mode (h2c) - HTTP/2 only (prior knowledge)
+        let io = TokioIo::new(stream);
+        Self::serve_h2(io, peer_addr, handler, config, cancel).await
+    }
+
+    async fn is_raw_tensor_connection(
+        stream: &tokio::net::TcpStream,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<bool> {
+        let mut prefix = [0u8; 4];
+        let peek = async {
+            loop {
+                let count = stream.peek(&mut prefix).await?;
+                if count == 0 {
+                    return Ok::<bool, std::io::Error>(false);
+                }
+                if count >= prefix.len() {
+                    return Ok(&prefix == RAW_TENSOR_MAGIC);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        };
+        tokio::time::timeout(timeout, peek)
+            .await
+            .map_err(|_| anyhow::anyhow!("Connection preface timeout"))?
+            .map_err(Into::into)
+    }
+
+    async fn serve_raw_tensor(
+        mut stream: tokio::net::TcpStream,
+        peer_addr: SocketAddr,
+        handler: Arc<dyn Http2ServerHandler>,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<()> {
+        stream.set_nodelay(true)?;
+        record_raw_tensor_connection();
+        tracing::debug!(peer = %peer_addr, "Raw tensor connection established");
+        let max_requests = std::env::var("PULSING_TENSOR_MAX_REQUESTS_PER_CONNECTION")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(usize::MAX)
+            .max(1);
+        let mut requests = 0usize;
+
+        loop {
+            let frame = tokio::select! {
+                frame = read_raw_tensor_frame(&mut stream) => frame,
+                _ = cancel.cancelled() => return Ok(()),
+            }
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+
+            let version = frame.message.version;
+            match frame.kind {
+                RawTensorKind::Ask => {
+                    match handler
+                        .handle_message_full(&frame.path, Message::Tensor(frame.message))
+                        .await
+                    {
+                        Ok(Message::Tensor(response)) => {
+                            write_raw_tensor_frame(
+                                &mut stream,
+                                RawTensorKind::TensorResponse,
+                                "",
+                                &response,
+                            )
+                            .await
+                            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                        }
+                        Ok(Message::Single { msg_type, data }) => {
+                            let response =
+                                TensorMessage::new(version, Bytes::from(data), Vec::new());
+                            write_raw_tensor_frame(
+                                &mut stream,
+                                RawTensorKind::SingleResponse,
+                                &msg_type,
+                                &response,
+                            )
+                            .await
+                            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                        }
+                        Ok(Message::Stream { .. }) => {
+                            Self::write_raw_tensor_error(
+                                &mut stream,
+                                version,
+                                "Tensor request returned a streaming response",
+                            )
+                            .await?;
+                        }
+                        Err(error) => {
+                            Self::write_raw_tensor_error(&mut stream, version, &error.to_string())
+                                .await?;
+                        }
+                    }
+                }
+                RawTensorKind::Tell => {
+                    match handler
+                        .handle_tell_full(&frame.path, Message::Tensor(frame.message))
+                        .await
+                    {
+                        Ok(()) => {
+                            let ack = TensorMessage::new(version, Bytes::new(), Vec::new());
+                            write_raw_tensor_frame(&mut stream, RawTensorKind::Ack, "", &ack)
+                                .await
+                                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                        }
+                        Err(error) => {
+                            Self::write_raw_tensor_error(&mut stream, version, &error.to_string())
+                                .await?;
+                        }
+                    }
+                }
+                unexpected => {
+                    Self::write_raw_tensor_error(
+                        &mut stream,
+                        version,
+                        &format!("Unexpected request frame: {unexpected:?}"),
+                    )
+                    .await?;
+                }
+            }
+            requests += 1;
+            if requests >= max_requests {
+                return Ok(());
+            }
+        }
+    }
+
+    async fn write_raw_tensor_error(
+        stream: &mut tokio::net::TcpStream,
+        version: u32,
+        error: &str,
+    ) -> anyhow::Result<()> {
+        let message = TensorMessage::new(
+            version,
+            Bytes::copy_from_slice(error.as_bytes()),
+            Vec::new(),
+        );
+        write_raw_tensor_frame(stream, RawTensorKind::Error, "", &message)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
+    }
+
+    /// Serve HTTP/2 only (prior knowledge mode)
+    async fn serve_h2(
+        io: TokioIo<tokio::net::TcpStream>,
+        peer_addr: SocketAddr,
+        handler: Arc<dyn Http2ServerHandler>,
+        config: Http2Config,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<()> {
+        Self::serve_h2_generic(io, peer_addr, handler, config, cancel).await
+    }
+
+    /// Generic HTTP/2 server - works with any IO type (TCP or TLS)
+    async fn serve_h2_generic<I>(
+        io: TokioIo<I>,
+        peer_addr: SocketAddr,
+        handler: Arc<dyn Http2ServerHandler>,
+        config: Http2Config,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<()>
+    where
+        I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let service = service_fn(move |req| {
+            let handler = handler.clone();
+            async move { Self::handle_request(req, handler, peer_addr).await }
+        });
+
+        let mut h2_builder = http2::Builder::new(TokioExecutor::new());
+        h2_builder
+            .max_concurrent_streams(config.max_concurrent_streams)
+            .initial_stream_window_size(config.initial_window_size)
+            .initial_connection_window_size(config.initial_connection_window_size)
+            .max_frame_size(config.max_frame_size)
+            .max_header_list_size(config.max_header_list_size);
+
+        let conn = h2_builder.serve_connection(io, service);
+
+        tokio::select! {
+            result = conn => {
+                if let Err(e) = result {
+                    tracing::debug!(peer = %peer_addr, error = %e, "HTTP/2 connection error");
+                }
+            }
+            _ = cancel.cancelled() => {
+                tracing::debug!(peer = %peer_addr, "Connection cancelled");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle a single HTTP request
+    async fn handle_request(
+        req: Request<Incoming>,
+        handler: Arc<dyn Http2ServerHandler>,
+        peer_addr: SocketAddr,
+    ) -> std::result::Result<Response<BoxBody>, Infallible> {
+        let path = req.uri().path().to_string();
+        let method = req.method().clone();
+
+        // Link to upstream trace: W3C traceparent + optional tracestate → remote parent → child span
+        let tp = req
+            .headers()
+            .get(TRACEPARENT_HEADER)
+            .and_then(|v| v.to_str().ok());
+        let ts = req
+            .headers()
+            .get(TRACESTATE_HEADER)
+            .and_then(|v| v.to_str().ok());
+        let parent_trace = tp.and_then(|tp| TraceContext::from_w3c_headers(tp, ts));
+
+        let parent_otel = parent_trace
+            .as_ref()
+            .map(TraceContext::remote_parent_context)
+            .unwrap_or_default();
+
+        let span = tracing::info_span!(
+            "http.request",
+            otel.name = %format!("{} {}", method, path),
+            http.method = %method,
+            http.route = %path,
+            http.peer = %peer_addr,
+        );
+        span.set_parent(parent_otel);
+
+        async move {
+        // Health check endpoint
+        if path == "/health" && method == Method::GET {
+            let health = handler.health_check().await;
+            let body = serde_json::to_vec(&health).unwrap_or_default();
+            return Ok(json_response(StatusCode::OK, body));
+        }
+
+        // Prometheus metrics endpoint
+        if path == "/metrics" && method == Method::GET {
+            let metrics = handler.prometheus_metrics().await;
+            return Ok(text_response(StatusCode::OK, metrics.into_bytes()));
+        }
+
+        // Cluster members endpoint (for CLI tools)
+        if path == "/cluster/members" && method == Method::GET {
+            let members = handler.cluster_members().await;
+            let body = serde_json::to_vec(&members).unwrap_or_default();
+            return Ok(json_response(StatusCode::OK, body));
+        }
+
+        // Actors list endpoint (for CLI tools)
+        if (path == "/actors" || path == "/actors/") && method == Method::GET {
+            // Check for ?all=true query parameter
+            let include_internal = req
+                .uri()
+                .query()
+                .map(|q| q.contains("all=true"))
+                .unwrap_or(false);
+            let actors = handler.actors_list(include_internal).await;
+            let body = serde_json::to_vec(&actors).unwrap_or_default();
+            return Ok(json_response(StatusCode::OK, body));
+        }
+
+        // Client resolve endpoint (out-cluster)
+        if path == "/client/resolve" && method == Method::POST {
+            let body_bytes = match req.collect().await {
+                Ok(collected) => collected.to_bytes().to_vec(),
+                Err(e) => {
+                    return Ok(error_response(
+                        StatusCode::BAD_REQUEST,
+                        format!("Failed to read body: {}", e).into_bytes(),
+                    ));
+                }
+            };
+            let resolve_req: serde_json::Value =
+                serde_json::from_slice(&body_bytes).unwrap_or_default();
+            let actor_path = resolve_req
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let result = handler.handle_client_resolve(actor_path).await;
+            let body = serde_json::to_vec(&result).unwrap_or_default();
+            return Ok(json_response(StatusCode::OK, body));
+        }
+
+        // Client members endpoint (out-cluster)
+        if path == "/client/members" && method == Method::GET {
+            let result = handler.handle_client_members().await;
+            let body = serde_json::to_vec(&result).unwrap_or_default();
+            return Ok(json_response(StatusCode::OK, body));
+        }
+
+        // Head node API endpoints
+        if path.starts_with("/cluster/head/") {
+            let body_bytes = match req.collect().await {
+                Ok(collected) => collected.to_bytes().to_vec(),
+                Err(e) => {
+                    return Ok(error_response(
+                        StatusCode::BAD_REQUEST,
+                        format!("Failed to read body: {}", e).into_bytes(),
+                    ));
+                }
+            };
+
+            let method_str = method.as_str();
+            let path_str = path.as_str();
+            match handler
+                .handle_head_api(path_str, method_str, body_bytes)
+                .await
+            {
+                Ok(Some(response_body)) => {
+                    return Ok(json_response(StatusCode::OK, response_body));
+                }
+                Ok(None) => {
+                    return Ok(error_response(
+                        StatusCode::NOT_IMPLEMENTED,
+                        b"Head node API not supported by this handler".to_vec(),
+                    ));
+                }
+                Err(e) => {
+                    tracing::warn!(path = %path, method = %method, error = %e, "Head API error");
+                    return Ok(error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("{}", e).into_bytes(),
+                    ));
+                }
+            }
+        }
+
+        // Only POST for actor messages
+        if method != Method::POST {
+            return Ok(error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                b"Method not allowed".to_vec(),
+            ));
+        }
+
+        // Extract headers
+        let mode = req
+            .headers()
+            .get(headers::MESSAGE_MODE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(MessageMode::parse)
+            .unwrap_or(MessageMode::Ask);
+
+        let msg_type = req
+            .headers()
+            .get(headers::MESSAGE_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        // Check if this is a streaming request
+        let request_type = req
+            .headers()
+            .get(headers::REQUEST_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(RequestType::parse)
+            .unwrap_or(RequestType::Single);
+
+        // Dispatch based on mode
+        if path == "/cluster/gossip" {
+            // Gossip doesn't support streaming
+            let body_bytes = match req.collect().await {
+                Ok(collected) => collected.to_bytes().to_vec(),
+                Err(e) => {
+                    return Ok(error_response(
+                        StatusCode::BAD_REQUEST,
+                        format!("Failed to read body: {}", e).into_bytes(),
+                    ));
+                }
+            };
+            return Self::handle_gossip_request(&handler, body_bytes, peer_addr).await;
+        }
+
+        match mode {
+            MessageMode::Tell => {
+                let is_tensor = msg_type == TENSOR_MESSAGE_TYPE;
+                let body = match Self::collect_actor_body(req.into_body(), is_tensor).await {
+                    Ok(body) => body,
+                    Err(e) => {
+                        return Ok(error_response(
+                            StatusCode::BAD_REQUEST,
+                            format!("Failed to read body: {e}").into_bytes(),
+                        ));
+                    }
+                };
+                let msg = match Self::decode_single_or_tensor(&msg_type, body) {
+                    Ok(msg) => msg,
+                    Err(e) => {
+                        return Ok(error_response(
+                            StatusCode::BAD_REQUEST,
+                            e.to_string().into_bytes(),
+                        ));
+                    }
+                };
+                Self::handle_tell_request_full(&handler, &path, msg).await
+            }
+            // Ask and Stream mode - check for streaming request
+            MessageMode::Ask | MessageMode::Stream => {
+                match request_type {
+                    RequestType::Single => {
+                        let is_tensor = msg_type == TENSOR_MESSAGE_TYPE;
+                        let body =
+                            match Self::collect_actor_body(req.into_body(), is_tensor).await {
+                                Ok(body) => body,
+                            Err(e) => {
+                                return Ok(error_response(
+                                    StatusCode::BAD_REQUEST,
+                                        format!("Failed to read body: {e}").into_bytes(),
+                                ));
+                            }
+                            };
+                        let msg = match Self::decode_single_or_tensor(&msg_type, body) {
+                            Ok(msg) => msg,
+                            Err(e) => {
+                                return Ok(error_response(
+                                    StatusCode::BAD_REQUEST,
+                                    e.to_string().into_bytes(),
+                                ));
+                            }
+                        };
+                        Self::handle_message_request_full(&handler, &path, msg).await
+                    }
+                    RequestType::Stream => {
+                        // Streaming request - parse binary frames into Message::Stream
+                        let msg = Self::parse_streaming_request(req.into_body(), &msg_type);
+                        Self::handle_message_request_full(&handler, &path, msg).await
+                    }
+                }
+            }
+        }
+        }
+        .instrument(span)
+        .await
+    }
+
+    fn decode_single_or_tensor(msg_type: &str, body: Bytes) -> Result<Message> {
+        if msg_type == TENSOR_MESSAGE_TYPE {
+            TensorMessage::decode_wire(body).map(Message::Tensor)
+        } else {
+            Ok(Message::single(msg_type, body.to_vec()))
+        }
+    }
+
+    async fn collect_actor_body(
+        body: Incoming,
+        is_tensor: bool,
+    ) -> std::result::Result<Bytes, String> {
+        if is_tensor {
+            Limited::new(body, max_tensor_wire_bytes())
+                .collect()
+                .await
+                .map(|collected| collected.to_bytes())
+                .map_err(|error| error.to_string())
+        } else {
+            body.collect()
+                .await
+                .map(|collected| collected.to_bytes())
+                .map_err(|error| error.to_string())
+        }
+    }
+
+    /// Parse a streaming request body (binary frames) into Message::Stream
+    fn parse_streaming_request(body: Incoming, default_msg_type: &str) -> Message {
+        let (tx, rx) = mpsc::channel::<Result<Message>>(32);
+        let default_msg_type = default_msg_type.to_string();
+
+        tokio::spawn(async move {
+            let mut parser = BinaryFrameParser::new();
+            let mut body_stream = http_body_util::BodyStream::new(body);
+            while let Some(result) = body_stream.next().await {
+                match result {
+                    Ok(frame) => {
+                        if let Ok(data) = frame.into_data() {
+                            parser.push(&data);
+
+                            for frame_result in parser.parse_all() {
+                                match frame_result {
+                                    Ok(frame) => {
+                                        if frame.end && frame.get_data().is_empty() {
+                                            continue;
+                                        }
+                                        match frame.to_message() {
+                                            Ok(Some(msg)) => {
+                                                if tx.send(Ok(msg)).await.is_err() {
+                                                    return;
+                                                }
+                                            }
+                                            Ok(None) => {}
+                                            Err(e) => {
+                                                let _ = tx.send(Err(e)).await;
+                                                return;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = tx
+                                            .send(Err(PulsingError::from(RuntimeError::Other(
+                                                e.to_string(),
+                                            ))))
+                                            .await;
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(PulsingError::from(RuntimeError::Other(e.to_string()))))
+                            .await;
+                        return;
+                    }
+                }
+            }
+        });
+
+        // Create Message::Stream from channel
+        Message::from_channel(default_msg_type, rx)
+    }
+
+    async fn handle_gossip_request(
+        handler: &Arc<dyn Http2ServerHandler>,
+        payload: Vec<u8>,
+        peer_addr: SocketAddr,
+    ) -> std::result::Result<Response<BoxBody>, Infallible> {
+        match handler.handle_gossip(payload, peer_addr).await {
+            Ok(Some(response)) => Ok(octet_response(StatusCode::OK, response)),
+            Ok(None) => Ok(empty_response(StatusCode::OK)),
+            Err(e) => Ok(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                e.to_string().into_bytes(),
+            )),
+        }
+    }
+
+    /// Unified message handler - accepts Message (Single or Stream) and handles response
+    async fn handle_message_request_full(
+        handler: &Arc<dyn Http2ServerHandler>,
+        path: &str,
+        msg: Message,
+    ) -> std::result::Result<Response<BoxBody>, Infallible> {
+        match handler.handle_message_full(path, msg).await {
+            Ok(Message::Single { msg_type, data }) => {
+                // Preserve the message type so the client can select the
+                // matching decoder (for example Python pickle for a small
+                // application-level tensor ACK).
+                Ok(octet_response_with_headers(
+                    StatusCode::OK,
+                    full_body(data),
+                    &[
+                        (headers::RESPONSE_TYPE, "single"),
+                        (headers::MESSAGE_TYPE, &msg_type),
+                    ],
+                ))
+            }
+            Ok(Message::Stream {
+                default_msg_type,
+                stream,
+            }) => {
+                // Stream response - convert Message stream to binary frames
+                let (tx, rx) = mpsc::channel::<std::result::Result<Frame<Bytes>, Infallible>>(32);
+
+                tokio::spawn(async move {
+                    let mut stream = std::pin::pin!(stream);
+
+                    while let Some(result) = stream.next().await {
+                        let frame = match result {
+                            Ok(msg) => StreamFrame::from_message(&msg, &default_msg_type),
+                            Err(e) => StreamFrame::error(e.to_string()),
+                        };
+
+                        if tx.send(Ok(Frame::data(frame.to_binary()))).await.is_err() {
+                            break;
+                        }
+                    }
+
+                    // Send end frame
+                    let _ = tx
+                        .send(Ok(Frame::data(StreamFrame::end().to_binary())))
+                        .await;
+                });
+
+                let body_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+                let body = StreamBody::new(body_stream);
+
+                Ok(octet_response_with_headers(
+                    StatusCode::OK,
+                    BoxBody::new(body),
+                    &[(headers::RESPONSE_TYPE, "stream")],
+                ))
+            }
+            Ok(Message::Tensor(tensor)) => match tensor.encode_wire() {
+                Ok(wire) => Ok(octet_response_with_headers(
+                    StatusCode::OK,
+                    full_body(wire),
+                    &[(headers::RESPONSE_TYPE, "tensor")],
+                )),
+                Err(e) => Ok(error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    e.to_string().into_bytes(),
+                )),
+            },
+            Err(e) => Ok(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                e.to_string().into_bytes(),
+            )),
+        }
+    }
+
+    async fn handle_tell_request_full(
+        handler: &Arc<dyn Http2ServerHandler>,
+        path: &str,
+        msg: Message,
+    ) -> std::result::Result<Response<BoxBody>, Infallible> {
+        match handler.handle_tell_full(path, msg).await {
+            Ok(()) => Ok(empty_response(StatusCode::ACCEPTED)),
+            Err(e) => Ok(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                e.to_string().into_bytes(),
+            )),
+        }
+    }
+}
+
+// Body type aliases
+type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
+
+fn full_body(data: Vec<u8>) -> BoxBody {
+    BoxBody::new(Full::new(Bytes::from(data)).map_err(|_| unreachable!()))
+}
+
+fn empty_body() -> BoxBody {
+    BoxBody::new(http_body_util::Empty::new().map_err(|_| unreachable!()))
+}
+
+// ============================================================================
+// Response builder helpers - panic-free with fallback to 500 Internal Server Error
+// ============================================================================
+
+/// Fallback response when response building fails (should never happen with valid inputs)
+fn fallback_500() -> Response<BoxBody> {
+    // This uses a minimal builder that cannot fail
+    Response::new(full_body(b"Internal Server Error".to_vec()))
+}
+
+/// Build a JSON response with the given status code
+fn json_response(status: StatusCode, body: Vec<u8>) -> Response<BoxBody> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(full_body(body))
+        .unwrap_or_else(|e| {
+            tracing::error!("Failed to build JSON response: {}", e);
+            fallback_500()
+        })
+}
+
+/// Build an octet-stream response with the given status code
+fn octet_response(status: StatusCode, body: Vec<u8>) -> Response<BoxBody> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/octet-stream")
+        .body(full_body(body))
+        .unwrap_or_else(|e| {
+            tracing::error!("Failed to build octet-stream response: {}", e);
+            fallback_500()
+        })
+}
+
+/// Build an octet-stream response with custom headers
+fn octet_response_with_headers(
+    status: StatusCode,
+    body: BoxBody,
+    headers: &[(&str, &str)],
+) -> Response<BoxBody> {
+    let mut builder = Response::builder()
+        .status(status)
+        .header("content-type", "application/octet-stream");
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    builder.body(body).unwrap_or_else(|e| {
+        tracing::error!("Failed to build response with headers: {}", e);
+        fallback_500()
+    })
+}
+
+/// Build a text response (for metrics endpoint)
+fn text_response(status: StatusCode, body: Vec<u8>) -> Response<BoxBody> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
+        .body(full_body(body))
+        .unwrap_or_else(|e| {
+            tracing::error!("Failed to build text response: {}", e);
+            fallback_500()
+        })
+}
+
+/// Build an empty response with the given status code
+fn empty_response(status: StatusCode) -> Response<BoxBody> {
+    Response::builder()
+        .status(status)
+        .body(empty_body())
+        .unwrap_or_else(|e| {
+            tracing::error!("Failed to build empty response: {}", e);
+            fallback_500()
+        })
+}
+
+/// Build an error response with the given status code and message
+fn error_response(status: StatusCode, message: impl Into<Vec<u8>>) -> Response<BoxBody> {
+    Response::builder()
+        .status(status)
+        .body(full_body(message.into()))
+        .unwrap_or_else(|e| {
+            tracing::error!("Failed to build error response: {}", e);
+            fallback_500()
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::actor::Message;
+
+    struct MockHandler;
+
+    #[async_trait::async_trait]
+    impl Http2ServerHandler for MockHandler {
+        async fn handle_message_simple(
+            &self,
+            _path: &str,
+            _msg_type: &str,
+            payload: Vec<u8>,
+        ) -> Result<Message> {
+            Ok(Message::single("", payload))
+        }
+
+        async fn handle_tell(&self, _path: &str, _msg_type: &str, _payload: Vec<u8>) -> Result<()> {
+            Ok(())
+        }
+
+        async fn handle_gossip(
+            &self,
+            _payload: Vec<u8>,
+            _peer_addr: SocketAddr,
+        ) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn test_server_creation() {
+        let handler = Arc::new(MockHandler);
+        let cancel = CancellationToken::new();
+
+        let server = Http2Server::new(
+            "127.0.0.1:0".parse().unwrap(),
+            handler,
+            Http2Config::default(),
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_ne!(server.local_addr().port(), 0);
+        cancel.cancel();
+    }
+}

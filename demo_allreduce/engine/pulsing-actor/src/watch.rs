@@ -1,0 +1,386 @@
+//! Actor lifecycle monitoring and fault tolerance
+//!
+//! This module provides:
+//! - Watch mechanism for monitoring actor lifecycle
+//! - Termination handling (logging, cleanup, notification)
+//! - Cluster broadcast for named actor failures
+
+use crate::actor::{ActorId, ActorPath, Envelope, Message, StopReason};
+use crate::cluster::NamingBackend;
+use dashmap::DashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use tokio::sync::{mpsc, RwLock};
+
+/// Actor lifecycle manager
+///
+/// Centralized management of actor lifecycle events including:
+/// - Watch/unwatch relationships
+/// - Termination handling
+/// - Cluster broadcast
+/// - Routing table cleanup
+pub struct ActorLifecycle {
+    /// Watch registry: target_actor_id -> set of watcher_actor_ids
+    watchers: RwLock<HashMap<ActorId, HashSet<ActorId>>>,
+}
+
+impl ActorLifecycle {
+    /// Create a new actor lifecycle manager
+    pub fn new() -> Self {
+        Self {
+            watchers: RwLock::new(HashMap::new()),
+        }
+    }
+
+    // ==================== Watch API ====================
+
+    /// Register a watch: watcher will be notified when target stops
+    pub async fn watch(&self, watcher: &ActorId, target: &ActorId) {
+        let mut watchers = self.watchers.write().await;
+        watchers.entry(*target).or_default().insert(*watcher);
+
+        tracing::debug!(
+            watcher = %watcher,
+            target = %target,
+            "Watch registered"
+        );
+    }
+
+    /// Remove a watch relationship
+    pub async fn unwatch(&self, watcher: &ActorId, target: &ActorId) {
+        let mut watchers = self.watchers.write().await;
+        if let Some(watcher_set) = watchers.get_mut(target) {
+            watcher_set.remove(watcher);
+            if watcher_set.is_empty() {
+                watchers.remove(target);
+            }
+        }
+
+        tracing::debug!(
+            watcher = %watcher,
+            target = %target,
+            "Watch removed"
+        );
+    }
+
+    // ==================== Termination Handling ====================
+
+    /// Handle actor termination
+    ///
+    /// This is the main entry point for processing actor termination events.
+    /// It handles:
+    /// 1. Logging the termination
+    /// 2. Cleaning up routing tables
+    /// 3. Broadcasting to cluster (for named actors)
+    /// 4. Notifying all watchers
+    ///
+    /// # Arguments
+    /// * `actor_id` - The terminated actor's ID
+    /// * `named_path` - Optional named actor path
+    /// * `reason` - Why the actor stopped
+    /// * `named_actor_paths` - Routing table to clean up
+    /// * `cluster` - Cluster reference for broadcasting
+    /// * `get_sender` - Function to get sender for notifying watchers
+    #[allow(clippy::too_many_arguments)]
+    pub async fn handle_termination<F>(
+        &self,
+        actor_id: &ActorId,
+        named_path: Option<ActorPath>,
+        reason: StopReason,
+        named_actor_paths: &DashMap<String, String>,
+        cluster: &RwLock<Option<Arc<dyn NamingBackend>>>,
+        get_sender: F,
+    ) where
+        F: Fn(&ActorId) -> Option<mpsc::Sender<Envelope>>,
+    {
+        // 1. Log termination
+        self.log_termination(actor_id, named_path.as_ref(), &reason);
+
+        // 2. Cleanup routing table and broadcast to cluster
+        self.cleanup_and_broadcast(
+            actor_id,
+            named_path.as_ref(),
+            &reason,
+            named_actor_paths,
+            cluster,
+        )
+        .await;
+
+        // 3. Notify all watchers
+        self.notify_watchers(actor_id, reason, get_sender).await;
+    }
+
+    /// Log actor termination event
+    fn log_termination(
+        &self,
+        actor_id: &ActorId,
+        named_path: Option<&ActorPath>,
+        reason: &StopReason,
+    ) {
+        if let Some(path) = named_path {
+            tracing::info!(
+                actor_id = %actor_id,
+                path = %path,
+                reason = %reason,
+                "Named actor terminated"
+            );
+        } else {
+            tracing::info!(
+                actor_id = %actor_id,
+                reason = %reason,
+                "Actor terminated"
+            );
+        }
+    }
+
+    /// Clean up routing table and broadcast failure to cluster
+    async fn cleanup_and_broadcast(
+        &self,
+        actor_id: &ActorId,
+        named_path: Option<&ActorPath>,
+        reason: &StopReason,
+        named_actor_paths: &DashMap<String, String>,
+        cluster: &RwLock<Option<Arc<dyn NamingBackend>>>,
+    ) {
+        if let Some(path) = named_path {
+            // Remove from routing table
+            let path_key = path.as_str();
+            named_actor_paths.remove(&path_key);
+
+            // Broadcast failure to cluster
+            let cluster_guard = cluster.read().await;
+            if let Some(cluster) = cluster_guard.as_ref() {
+                cluster.broadcast_named_actor_failed(path, reason).await;
+                cluster.unregister_named_actor(path).await;
+            }
+        } else {
+            // Legacy actor - just unregister from cluster
+            let cluster_guard = cluster.read().await;
+            if let Some(cluster) = cluster_guard.as_ref() {
+                cluster.unregister_actor(actor_id).await;
+            }
+        }
+    }
+
+    /// Notify all watchers that an actor has terminated
+    async fn notify_watchers<F>(&self, actor_id: &ActorId, reason: StopReason, get_sender: F)
+    where
+        F: Fn(&ActorId) -> Option<mpsc::Sender<Envelope>>,
+    {
+        // Get and remove watchers for this actor
+        let watcher_ids = {
+            let mut watchers = self.watchers.write().await;
+            watchers.remove(actor_id).unwrap_or_default()
+        };
+
+        if watcher_ids.is_empty() {
+            return;
+        }
+
+        tracing::info!(
+            actor_id = %actor_id,
+            reason = %reason,
+            watcher_count = watcher_ids.len(),
+            "Notifying watchers of actor termination"
+        );
+
+        // Create termination message with actor_id and reason
+        let termination_msg = (*actor_id, reason.clone());
+
+        let msg = match Message::pack(&termination_msg) {
+            Ok(msg) => msg,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to serialize termination message");
+                return;
+            }
+        };
+
+        // Get payload bytes (termination message is always single message)
+        let (msg_type, payload_bytes) = match msg {
+            Message::Single { msg_type, data } => (msg_type, data),
+            Message::Stream {
+                default_msg_type, ..
+            } => (default_msg_type, Vec::new()),
+            Message::Tensor(_) => unreachable!("termination messages are always packed singles"),
+        };
+
+        // Send to all watchers
+        for watcher_id in watcher_ids {
+            if let Some(sender) = get_sender(&watcher_id) {
+                let envelope = Envelope::tell(Message::single(&msg_type, payload_bytes.clone()));
+                if let Err(e) = sender.try_send(envelope) {
+                    tracing::warn!(
+                        watcher = %watcher_id,
+                        error = %e,
+                        "Failed to send termination message to watcher"
+                    );
+                }
+            }
+        }
+    }
+
+    // ==================== Batch Operations ====================
+
+    /// Remove an actor from all watch relationships
+    ///
+    /// Call this when an actor is being removed from the system.
+    /// It removes the actor both as a target and as a watcher.
+    pub async fn remove_actor(&self, actor_id: &ActorId) {
+        let mut watchers = self.watchers.write().await;
+
+        // Remove as target
+        watchers.remove(actor_id);
+
+        // Remove as watcher from all targets, and clean up empty entries
+        let mut empty_targets = Vec::new();
+        for (target, watcher_set) in watchers.iter_mut() {
+            watcher_set.remove(actor_id);
+            if watcher_set.is_empty() {
+                empty_targets.push(*target);
+            }
+        }
+
+        for target in empty_targets {
+            watchers.remove(&target);
+        }
+    }
+
+    /// Clear all watch relationships
+    ///
+    /// Call this during system shutdown.
+    pub async fn clear(&self) {
+        let mut watchers = self.watchers.write().await;
+        watchers.clear();
+    }
+
+    // ==================== Query API ====================
+
+    /// Get the number of actors being watched
+    pub async fn watched_count(&self) -> usize {
+        self.watchers.read().await.len()
+    }
+
+    /// Get watchers for a specific actor
+    pub async fn get_watchers(&self, target: &ActorId) -> HashSet<ActorId> {
+        self.watchers
+            .read()
+            .await
+            .get(target)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Check if an actor is being watched
+    pub async fn is_watched(&self, target: &ActorId) -> bool {
+        self.watchers.read().await.contains_key(target)
+    }
+}
+
+impl Default for ActorLifecycle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_watch_unwatch() {
+        let lifecycle = ActorLifecycle::new();
+
+        let watcher1 = ActorId::generate();
+        let watcher2 = ActorId::generate();
+        let target1 = ActorId::generate();
+
+        // Add watches
+        lifecycle.watch(&watcher1, &target1).await;
+        lifecycle.watch(&watcher2, &target1).await;
+
+        assert!(lifecycle.is_watched(&target1).await);
+        assert_eq!(lifecycle.get_watchers(&target1).await.len(), 2);
+
+        // Unwatch
+        lifecycle.unwatch(&watcher1, &target1).await;
+        assert_eq!(lifecycle.get_watchers(&target1).await.len(), 1);
+
+        lifecycle.unwatch(&watcher2, &target1).await;
+        assert!(!lifecycle.is_watched(&target1).await);
+    }
+
+    #[tokio::test]
+    async fn test_remove_actor() {
+        let lifecycle = ActorLifecycle::new();
+
+        let watcher1 = ActorId::generate();
+        let watcher2 = ActorId::generate();
+        let target1 = ActorId::generate();
+        let target2 = ActorId::generate();
+
+        // Setup: watcher1 watches target1 and target2
+        lifecycle.watch(&watcher1, &target1).await;
+        lifecycle.watch(&watcher1, &target2).await;
+        lifecycle.watch(&watcher2, &target1).await;
+
+        // Remove watcher1 from all relationships
+        lifecycle.remove_actor(&watcher1).await;
+
+        // watcher1 should be removed as watcher
+        let watchers = lifecycle.get_watchers(&target1).await;
+        assert!(!watchers.contains(&watcher1));
+        assert!(watchers.contains(&watcher2));
+
+        // target2 should have no watchers
+        assert!(!lifecycle.is_watched(&target2).await);
+    }
+
+    #[tokio::test]
+    async fn test_clear() {
+        let lifecycle = ActorLifecycle::new();
+
+        let w1 = ActorId::generate();
+        let w2 = ActorId::generate();
+        let t1 = ActorId::generate();
+        let t2 = ActorId::generate();
+
+        lifecycle.watch(&w1, &t1).await;
+        lifecycle.watch(&w2, &t2).await;
+
+        assert_eq!(lifecycle.watched_count().await, 2);
+
+        lifecycle.clear().await;
+
+        assert_eq!(lifecycle.watched_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_notify_watchers() {
+        let lifecycle = ActorLifecycle::new();
+
+        let watcher1 = ActorId::generate();
+        let watcher2 = ActorId::generate();
+        let target1 = ActorId::generate();
+
+        lifecycle.watch(&watcher1, &target1).await;
+        lifecycle.watch(&watcher2, &target1).await;
+
+        // Create a channel to receive notifications
+        let (tx, mut rx) = mpsc::channel::<Envelope>(10);
+
+        // Notify watchers
+        lifecycle
+            .notify_watchers(&target1, StopReason::Normal, |_id| Some(tx.clone()))
+            .await;
+
+        // Should receive 2 notifications
+        let mut count = 0;
+        while rx.try_recv().is_ok() {
+            count += 1;
+        }
+        assert_eq!(count, 2);
+
+        // Watchers should be cleared after notification
+        assert!(!lifecycle.is_watched(&target1).await);
+    }
+}

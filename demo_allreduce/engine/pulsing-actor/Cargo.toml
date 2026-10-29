@@ -1,0 +1,113 @@
+[package]
+name = "pulsing-actor"
+version.workspace = true
+edition = "2021"
+description = "Lightweight distributed actor framework for Pulsing"
+authors.workspace = true
+license.workspace = true
+repository = "https://github.com/DeepLink-org/Pulsing"
+keywords = ["actor", "distributed", "cluster", "gossip"]
+
+[features]
+default = ["tls"]
+# Enable integration tests that require a running cluster
+integration = []
+# Enable OTLP exporter for sending traces to Jaeger/Tempo
+otlp = ["opentelemetry-otlp"]
+# Enable TLS support with passphrase-derived certificates
+tls = ["dep:rustls", "dep:tokio-rustls", "dep:rcgen", "dep:aws-lc-rs", "dep:rustls-pemfile", "dep:time", "dep:sha2"]
+# Enable test helpers module for testing in downstream crates
+test-helper = []
+
+[dependencies]
+# Async runtime
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tokio-stream = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+bytes = { workspace = true }
+
+# Async utilities
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+# Concurrent data structures
+dashmap = { workspace = true }
+lru = "0.12"
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Logging & Tracing
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+
+# Utilities
+uuid = { workspace = true }
+rand = { workspace = true }
+
+# HTTP transport
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+
+# TLS (optional)
+rustls = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+rcgen = { workspace = true, optional = true }
+aws-lc-rs = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+time = { workspace = true, optional = true }
+sha2 = { version = "0.10", optional = true }
+
+# Span storage (mmap'd ring buffer, also discoverable by probing)
+probing-memtable = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[[example]]
+name = "ping_pong"
+path = "../../examples/rust/ping_pong.rs"
+
+[[example]]
+name = "cluster"
+path = "../../examples/rust/cluster.rs"
+
+[[example]]
+name = "message_patterns"
+path = "../../examples/rust/message_patterns.rs"
+
+[[example]]
+name = "named_actors"
+path = "../../examples/rust/named_actors.rs"
+
+[[example]]
+name = "behavior_counter"
+path = "../../examples/rust/behavior_counter.rs"
+
+[[example]]
+name = "behavior_fsm"
+path = "../../examples/rust/behavior_fsm.rs"
+
+[[example]]
+name = "http2_pool_expand"
+path = "../../examples/rust/http2_pool_expand.rs"
+
+
+[[bench]]
+name = "tracing_overhead"
+harness = false
+
+[lints]
+workspace = true

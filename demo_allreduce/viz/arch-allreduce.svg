@@ -1,0 +1,113 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="860" viewBox="0 0 1080 860" font-family="Consolas,monospace">
+  <defs>
+    <marker id="ab" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><path d="M0,0 L9,3.5 L0,7 Z" fill="#4fd8ff"/></marker>
+    <marker id="ag" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><path d="M0,0 L9,3.5 L0,7 Z" fill="#ffd700"/></marker>
+    <marker id="ag2" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><path d="M0,0 L9,3.5 L0,7 Z" fill="#7dffb8"/></marker>
+    <marker id="amu" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto"><path d="M0,0 L9,3.5 L0,7 Z" fill="#546e8a"/></marker>
+  </defs>
+  <rect width="1080" height="860" fill="#0a0e17"/>
+  <text x="540" y="34" text-anchor="middle" fill="#64ffda" font-size="20" font-weight="bold">万脑 AllReduce v2 — 2 × ActorSystem 均衡分片 (5051 : 5050)</text>
+  <text x="540" y="56" text-anchor="middle" fill="#546e8a" font-size="11">9999 worker → 100 mid → root → collector · 全部报数信跨进程投递</text>
+
+  <!-- 编排器 -->
+  <rect x="330" y="76" width="420" height="52" rx="10" fill="#111a2e" stroke="#2a5a8f"/>
+  <text x="540" y="98" text-anchor="middle" fill="#ffd700" font-size="13" font-weight="bold">编排器 run10k.py</text>
+  <text x="540" y="116" text-anchor="middle" fill="#546e8a" font-size="10">触发 9999+100+1 封 · 分阶段等待 · 空耗熔断 · 三方对账</text>
+  <line x1="440" y1="128" x2="290" y2="176" stroke="#546e8a" stroke-width="1.4" marker-end="url(#amu)" stroke-dasharray="5 3"/>
+  <line x1="640" y1="128" x2="790" y2="176" stroke="#546e8a" stroke-width="1.4" marker-end="url(#amu)" stroke-dasharray="5 3"/>
+  <text x="310" y="140" fill="#546e8a" font-size="9.5">触发×5000 @12400</text>
+  <text x="640" y="140" fill="#546e8a" font-size="9.5">触发×4999 @12500</text>
+
+  <!-- ActorSystem ① -->
+  <rect x="60" y="176" width="460" height="380" rx="14" fill="#0d1626" stroke="#4fa8ff" stroke-width="1.6"/>
+  <text x="80" y="202" fill="#4fa8ff" font-size="14" font-weight="bold">ActorSystem ① shard0</text>
+  <text x="80" y="218" fill="#546e8a" font-size="10">进程 · listen :12000 · 控制口 :12400 · 闸门=4 · 5051 个 actor</text>
+  <!-- workers ① -->
+  <rect x="88" y="238" width="404" height="92" rx="8" fill="#0f1e33" stroke="#2a4a6f"/>
+  <text x="100" y="258" fill="#4fa8ff" font-size="12" font-weight="bold">worker_1 .. worker_5000</text>
+  <text x="100" y="274" fill="#546e8a" font-size="9.5">常驻信箱壳 ~29KB/个 · 触发信唤醒→拉起一次性 codex→报数→codex销毁</text>
+  <g fill="#1c3a5f">
+    <circle cx="110" cy="298" r="4"/><circle cx="126" cy="298" r="4"/><circle cx="142" cy="298" r="4"/><circle cx="158" cy="298" r="4"/><circle cx="174" cy="298" r="4"/><circle cx="190" cy="298" r="4"/><circle cx="206" cy="298" r="4"/><circle cx="222" cy="298" r="4"/><circle cx="238" cy="298" r="4"/><circle cx="254" cy="298" r="4"/>
+  </g>
+  <g fill="#00c876">
+    <circle cx="270" cy="298" r="4"/><circle cx="286" cy="298" r="4"/><circle cx="302" cy="298" r="4"/><circle cx="318" cy="298" r="4"/>
+  </g>
+  <text x="340" y="302" fill="#546e8a" font-size="9.5">■绿=已报数 ■蓝=排队中</text>
+  <text x="100" y="322" fill="#3d5a80" font-size="9">思考=潮汐codex(暂态) · 身份/信件常驻信箱</text>
+
+  <!-- mid ① -->
+  <rect x="88" y="352" width="196" height="76" rx="8" fill="#0f1e33" stroke="#2a4a6f"/>
+  <text x="98" y="372" fill="#4fd8ff" font-size="12" font-weight="bold">mid_51 .. mid_100</text>
+  <text x="98" y="388" fill="#546e8a" font-size="9.5">50 个局部归约 actor</text>
+  <text x="98" y="404" fill="#546e8a" font-size="9.5">各收 ~100 封 → drain → 求部分和</text>
+  <text x="98" y="420" fill="#ffd700" font-size="9.5">→ 寄 P=&lt;sum&gt; C=&lt;count&gt;</text>
+
+  <!-- root -->
+  <rect x="88" y="452" width="196" height="80" rx="8" fill="#16130a" stroke="#ffd700" stroke-width="1.4"/>
+  <text x="98" y="474" fill="#ffd700" font-size="13" font-weight="bold">reducer (root) ★</text>
+  <text x="98" y="490" fill="#546e8a" font-size="9.5">drain 100 个 P= 部分和</text>
+  <text x="98" y="506" fill="#546e8a" font-size="9.5">模型相加 → TOTAL</text>
+  <text x="98" y="522" fill="#7dffb8" font-size="9.5">→ 寄 TOTAL 给 collector</text>
+
+  <!-- ActorSystem ② -->
+  <rect x="560" y="176" width="460" height="380" rx="14" fill="#150f26" stroke="#b48cff" stroke-width="1.6"/>
+  <text x="580" y="202" fill="#b48cff" font-size="14" font-weight="bold">ActorSystem ② shard1</text>
+  <text x="580" y="218" fill="#546e8a" font-size="10">进程 · listen :12100 · 控制口 :12500 · 闸门=4 · 5050 个 actor</text>
+  <!-- workers ② -->
+  <rect x="588" y="238" width="404" height="92" rx="8" fill="#1a1330" stroke="#4a3a6f"/>
+  <text x="600" y="258" fill="#b48cff" font-size="12" font-weight="bold">worker_5001 .. worker_9999</text>
+  <text x="600" y="274" fill="#546e8a" font-size="9.5">与①完全同构 · 互不共享内存 · 仅靠信件网状层互通</text>
+  <g fill="#33265f">
+    <circle cx="610" cy="298" r="4"/><circle cx="626" cy="298" r="4"/><circle cx="642" cy="298" r="4"/><circle cx="658" cy="298" r="4"/><circle cx="674" cy="298" r="4"/><circle cx="690" cy="298" r="4"/><circle cx="706" cy="298" r="4"/>
+  </g>
+  <g fill="#00c876">
+    <circle cx="722" cy="298" r="4"/><circle cx="738" cy="298" r="4"/><circle cx="754" cy="298" r="4"/>
+  </g>
+  <text x="600" y="322" fill="#3d5a80" font-size="9">LLM 全局闸门=1: 两系统所有 codex 在代理处严格串行过模型</text>
+
+  <!-- mid ② -->
+  <rect x="796" y="352" width="196" height="76" rx="8" fill="#1a1330" stroke="#4a3a6f"/>
+  <text x="806" y="372" fill="#4fd8ff" font-size="12" font-weight="bold">mid_1 .. mid_50</text>
+  <text x="806" y="388" fill="#546e8a" font-size="9.5">50 个局部归约 actor</text>
+  <text x="806" y="404" fill="#546e8a" font-size="9.5">与 mid_51..100 跨系统镜像</text>
+  <text x="806" y="420" fill="#ffd700" font-size="9.5">→ 寄 P= C= 给 root(在①)</text>
+
+  <!-- collector -->
+  <rect x="796" y="452" width="196" height="80" rx="8" fill="#0f1e24" stroke="#7dffb8" stroke-width="1.4"/>
+  <text x="806" y="474" fill="#7dffb8" font-size="13" font-weight="bold">collector ▣</text>
+  <text x="806" y="490" fill="#546e8a" font-size="9.5">哑信箱 · 0 次 codex/LLM</text>
+  <text x="806" y="506" fill="#546e8a" font-size="9.5">只收 TOTAL 落箱</text>
+  <text x="806" y="522" fill="#546e8a" font-size="9.5">对账通道(不经模型加工)</text>
+
+  <!-- 跨片信件: ①workers → ②mids -->
+  <path d="M 480 285 C 560 285, 700 340, 830 352" fill="none" stroke="#4fa8ff" stroke-width="2.2" marker-end="url(#ab)" opacity="0.9"/>
+  <text x="576" y="296" fill="#4fa8ff" font-size="10.5">报数信 ×5000 (100% 跨进程 TCP)</text>
+  <!-- 跨片信件: ②workers → ①mids -->
+  <path d="M 600 320 C 520 330, 420 348, 300 352" fill="none" stroke="#b48cff" stroke-width="2.2" marker-end="url(#ab)" opacity="0.9"/>
+  <text x="368" y="344" fill="#b48cff" font-size="10.5">报数信 ×4999 (跨进程)</text>
+
+  <!-- mid② → root(跨进程) -->
+  <path d="M 830 428 C 700 470, 420 480, 292 486" fill="none" stroke="#ffd700" stroke-width="1.8" marker-end="url(#ag)" opacity="0.85"/>
+  <text x="480" y="452" fill="#ffd700" font-size="10">P= 部分和 ×50 (跨进程)</text>
+  <!-- mid① → root (进程内) -->
+  <path d="M 186 428 L 186 452" fill="none" stroke="#ffd700" stroke-width="1.8" marker-end="url(#ag)"/>
+  <text x="196" y="444" fill="#ffd700" font-size="10">P= ×50 (进程内)</text>
+  <!-- root → collector (跨进程) -->
+  <path d="M 292 496 C 460 530, 660 520, 796 500" fill="none" stroke="#7dffb8" stroke-width="2" marker-end="url(#ag2)"/>
+  <text x="470" y="530" fill="#7dffb8" font-size="10.5">TOTAL=545761? (跨进程, 最后一跳)</text>
+
+  <!-- 底层设施条 -->
+  <rect x="60" y="580" width="960" height="120" rx="12" fill="#0d1420" stroke="#1e3a5f"/>
+  <text x="80" y="604" fill="#64ffda" font-size="12" font-weight="bold">基础设施层</text>
+  <text x="80" y="626" fill="#9fb8d0" font-size="10.5">· 路由: 两系统各持 10101 条静态路由表(shops/名字→ip:port), 绕过 SWIM, 每封信发送前播种路由</text>
+  <text x="80" y="646" fill="#9fb8d0" font-size="10.5">· 投递语义: at-least-once + (from,seq) 去重 = 恰好一次效果 · 静默信只入箱不思考, 触发信唤醒回合</text>
+  <text x="80" y="666" fill="#9fb8d0" font-size="10.5">· 潮汐模型: actor(常驻壳,~29KB) ⇄ codex(一次性大脑,~130MB, 回合结束即焚) · 同时存活 codex ≤8</text>
+  <text x="80" y="686" fill="#9fb8d0" font-size="10.5">· 模型代理 :4011: LLM 严格串行(闸门=1) · tool_choice 强制 pulsing_send · 空耗守护分钟级巡检</text>
+
+  <!-- 对账条 -->
+  <rect x="60" y="724" width="960" height="106" rx="12" fill="#0f1a10" stroke="#2a5a3f"/>
+  <text x="80" y="748" fill="#7dffb8" font-size="12" font-weight="bold">终局三方对账 (判分与考核对象分离)</text>
+  <text x="80" y="770" fill="#9fb8d0" font-size="10.5">① 真值 = Python 出题时算好: sum(9999 个随机数) = 545761   (与任何 agent 无关, 不可被污染)</text>
+  <text x="80" y="790" fill="#9fb8d0" font-size="10.5">② 工具层 = 事件文件逐信核对: 每封 报数值==指派值? (当前 0 错值 / 0 丢信 / 0 死信 / 0 写失败)</text>
+  <text x="80" y="810" fill="#9fb8d0" font-size="10.5">③ 模型层 = root 口头 TOTAL vs 真值 (唯一被考核的算术, 树形归层使其只加 100 个部分和)</text>
+</svg>
