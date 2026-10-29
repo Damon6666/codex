@@ -413,6 +413,21 @@ def build_mermaid(run):
             lines.append(f" J-->>U: {exits[-1]['ts']} 交付收尾汇报(verdict={v})")
         lines.append(f" Note over J: {exits[-1]['ts']} 优雅退出 verdict={v}")
 
+    # 组网完成备注归位(单机场景): join 箭头是组网的 gossip 收尾, 备注若在
+    # 箭头之前会呈现"完成后还在组网"的错觉 — 移到连续入网箭头块的末尾。
+    if formed_note and not remote_names and formed_note in lines:
+        ni = lines.index(formed_note)
+        last_join, j = ni, ni + 1
+        while j < len(lines):
+            t = lines[j].lstrip()
+            if "入网 @" in lines[j]:
+                last_join = j
+            elif t.startswith(("J->>", "U->>", "Note")):
+                break
+            j += 1
+        if last_join > ni:
+            lines.insert(last_join + 1, lines.pop(ni))
+
     mmd = "\n".join(lines)
     return mmd, len(order) + 1, len(arrows)
 
