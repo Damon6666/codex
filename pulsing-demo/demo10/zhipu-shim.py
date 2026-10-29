@@ -191,11 +191,17 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": "not found"})
             return
         try:
+            # 诊断: 入口即记头(定位Expect/chunked/复用形态)
+            _hdrs = {k: v for k, v in self.headers.items()}
+            log(f"HDRS {_hdrs}")
             ln = int(self.headers.get("Content-Length", 0))
+            # 诊断: 读体前记录头, 定位卡死的请求形态(chunked/超长/复用连接)
+            if self.headers.get("Transfer-Encoding"):
+                log(f"WARN chunked请求! TE={self.headers.get('Transfer-Encoding')}")
+            if ln > 200000:
+                log(f"NOTE 大请求体 Content-Length={ln}")
             body_raw = self.rfile.read(ln)
-            if os.environ.get("SHIM_DEBUG"):
-                log(f"HDRS {dict(self.headers.items())}")
-                log(f"BODY read={len(body_raw)}B expect={ln}")
+            log(f"BODY read={len(body_raw)}B expect={ln}")
             req = json.loads(body_raw)
         except Exception as e:  # noqa: BLE001
             self._json(400, {"error": f"bad request: {e}"})
@@ -225,8 +231,7 @@ class Handler(BaseHTTPRequestHandler):
         stream = bool(req.get("stream"))
         # 调试: 每次记工具名(首个请求全量转储在下方 makedirs 块)
         _tools = req.get("tools") or []
-        if os.environ.get("SHIM_DEBUG"):
-            log(f"REQ tools={len(_tools)} names={[t.get('name') or t.get('type') for t in _tools]}")
+        log(f"REQ tools={len(_tools)} names={[t.get('name') or t.get('type') for t in _tools]}")
         # 全量请求转储(前60个) — 排查消息转换问题用
         try:
             os.makedirs("/tmp/shim-reqs", exist_ok=True)
@@ -242,6 +247,9 @@ class Handler(BaseHTTPRequestHandler):
                     if isinstance(_sub, dict) and _sub.get("name"):
                         NS_MAP[_sub["name"]] = _t.get("name")
         payload = resp_to_chat(req)
+        if stream:
+            self._stream_responses(payload)
+            return
         t0 = time.time()
         try:
             data = zhipu_chat(payload)
@@ -265,38 +273,123 @@ class Handler(BaseHTTPRequestHandler):
                                                 (u.get("prompt_tokens", 0)
                                                  + u.get("completion_tokens", 0)))}})
             return
-        # 流式: 智谱 chat 非流式结果 → Responses SSE 事件序列
-        rid = f"resp_{uuid.uuid4().hex[:24]}"
-        out, _ = chat_to_resp_output(data)
-        evs = [{"type": "response.created", "response": {"id": rid, "status": "in_progress"}}]
-        for item in out:
-            evs.append({"type": "response.output_item.added",
-                        "output_index": 0, "item": item})
-            if item["type"] == "message":
-                evs.append({"type": "response.output_text.delta",
-                            "output_index": 0, "item_id": item["id"],
-                            "delta": item["content"][0]["text"]})
-            else:
-                evs.append({"type": "response.function_call_arguments.delta",
-                            "output_index": 0, "item_id": item["id"],
-                            "delta": item["arguments"]})
-            evs.append({"type": "response.output_item.done",
-                        "output_index": 0, "item": item})
-        evs.append({"type": "response.completed", "response": {
-            "id": rid, "status": "completed", "model": payload["model"],
-            "output": out, "usage": {
-                "input_tokens": u.get("prompt_tokens", 0),
-                "output_tokens": u.get("completion_tokens", 0),
-                "total_tokens": u.get("total_tokens",
-                                      (u.get("prompt_tokens", 0)
-                                       + u.get("completion_tokens", 0)))}}})
-        body = "".join(f"event: {e['type']}\ndata: {json.dumps(e, ensure_ascii=False)}\n\n"
-                       for e in evs).encode()
+    def _stream_responses(self, payload):
+        """真流式: 智谱 chat SSE 逐 chunk 翻译下发——首字即达、增量不断,
+        codex 侧全程有心跳, 看门狗不再把长生成误判为悬挂(收尾率关键)."""
+        t0 = time.time()
+        body = json.dumps({**payload, "stream": True}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
         self.end_headers()
-        self.wfile.write(body)
+        rid = f"resp_{uuid.uuid4().hex[:24]}"
+
+        def ev(e):
+            self.wfile.write(
+                ("event: " + e["type"] + "\ndata: "
+                 + json.dumps(e, ensure_ascii=False) + "\n\n").encode())
+            self.wfile.flush()
+
+        ev({"type": "response.created", "response": {"id": rid, "status": "in_progress"}})
+        msg_item, msg_text = None, []
+        tool_items, usage = {}, {}
+        first_byte = None
+        try:
+            rq = urllib.request.Request(
+                ZHIPU_URL, data=body,
+                headers={"Authorization": "Bearer " + ZHIPU_KEY,
+                         "Content-Type": "application/json",
+                         "Accept": "text/event-stream"})
+            with urllib.request.urlopen(rq, timeout=240) as r:
+                for raw in r:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data_str = line[5:].strip()
+                    if data_str == "[DONE]":
+                        break
+                    if first_byte is None:
+                        first_byte = int((time.time() - t0) * 1000)
+                    try:
+                        chunk = json.loads(data_str)
+                    except ValueError:
+                        continue
+                    u = chunk.get("usage") or {}
+                    if u:
+                        usage = u
+                    for ch in chunk.get("choices", []):
+                        d = ch.get("delta", {}) or {}
+                        text = d.get("content") or ""
+                        if text:
+                            if msg_item is None:
+                                msg_item = {"type": "message",
+                                            "id": "msg_" + uuid.uuid4().hex[:8],
+                                            "role": "assistant", "status": "in_progress",
+                                            "content": []}
+                                ev({"type": "response.output_item.added",
+                                    "output_index": 0, "item": msg_item})
+                            ev({"type": "response.output_text.delta",
+                                "output_index": 0, "item_id": msg_item["id"],
+                                "delta": text})
+                            msg_text.append(text)
+                        for tc in d.get("tool_calls") or []:
+                            idx = tc.get("index", 0)
+                            fn = tc.get("function", {}) or {}
+                            it = tool_items.get(idx)
+                            if it is None:
+                                _n = fn.get("name", "")
+                                _ns = NS_MAP.get(_n)
+                                log(f"CALL {_n} ns={_ns} args={str(fn.get('arguments',''))[:60]}")
+                                it = {"type": "function_call",
+                                      "id": "fc_" + uuid.uuid4().hex[:8],
+                                      "call_id": tc.get("id") or "call_" + uuid.uuid4().hex[:8],
+                                      "name": _n, "arguments": "",
+                                      "status": "in_progress"}
+                                if _ns:
+                                    it["namespace"] = _ns
+                                tool_items[idx] = it
+                                ev({"type": "response.output_item.added",
+                                    "output_index": 1 + idx, "item": it})
+                            if fn.get("name") and not it["name"]:
+                                it["name"] = fn["name"]
+                            if fn.get("arguments"):
+                                ev({"type": "response.function_call_arguments.delta",
+                                    "output_index": 1 + idx, "item_id": it["id"],
+                                    "delta": fn["arguments"]})
+                                it["arguments"] += fn["arguments"]
+        except BrokenPipeError:
+            log("WARN client disconnected mid-stream")
+            return
+        except Exception as e:  # noqa: BLE001
+            log("STREAM_ERR " + type(e).__name__ + ": " + str(e))
+            try:
+                ev({"type": "error", "message": "shim stream: " + str(e)})
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
+        out = []
+        if msg_item is not None:
+            msg_item["content"] = [{"type": "output_text",
+                                    "text": "".join(msg_text), "annotations": []}]
+            msg_item["status"] = "completed"
+            ev({"type": "response.output_item.done", "output_index": 0, "item": msg_item})
+            out.append(msg_item)
+        for idx in sorted(tool_items):
+            it = tool_items[idx]
+            it["status"] = "completed"
+            ev({"type": "response.output_item.done", "output_index": 1 + idx, "item": it})
+            out.append(it)
+        pin, pout = usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0)
+        ev({"type": "response.completed", "response": {
+            "id": rid, "status": "completed", "model": payload.get("model", ""),
+            "output": out, "usage": {
+                "input_tokens": pin, "output_tokens": pout,
+                "total_tokens": usage.get("total_tokens", pin + pout)}}})
+        ms = int((time.time() - t0) * 1000)
+        log(f"OK-stream {ms}ms first_byte={first_byte}ms in={pin} out={pout} "
+            f"model={payload.get('model')} nmsg={len(payload['messages'])}")
 
     def log_message(self, fmt, *args):  # 全量访问日志(排查通道)
         log(f"HTTP {self.command} {self.path} from={self.client_address[0]}")
