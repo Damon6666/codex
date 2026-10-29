@@ -87,7 +87,8 @@ EOF
 
 # ───────────────────────── 4. 发射 demo ─────────────────────────
 # 铁律(实测踩坑): ①绝不能预设 CODEX_PULSING=1 ②stdin 必须 </dev/null
-pkill -9 -f "$(basename "$CODEX_BIN") -c model" 2>/dev/null; sleep 1
+# 清理本二进制的全部残留进程(judge是"-c model"形态, worker是"exec"形态——只杀judge会每轮泄漏9个worker挤爆内存)
+pkill -9 -f "$CODEX_BIN" 2>/dev/null; sleep 1
 export CODEX_HOME="$CODEX_HOME_DIR"
 export BRIDGE_KEY=sk-local-shim
 export CODEX_PULSING_TEAM="$TEAM"
@@ -123,7 +124,7 @@ while [ $WAITED -lt $CAP ]; do
     if [ "$M1" = "$M2" ]; then STATE=exit; break; fi
   fi
 done
-pkill -9 -f "$(basename "$CODEX_BIN") -c model" 2>/dev/null
+pkill -9 -f "$CODEX_BIN" 2>/dev/null
 
 # ───────────────────────── 6. 时序图 + 审计 ─────────────────────────
 echo; echo "══════════ 运行结束 ($STATE, ${WAITED}s) ══════════"
