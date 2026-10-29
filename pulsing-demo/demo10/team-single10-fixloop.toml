@@ -1,0 +1,91 @@
+# 闭环触发剧本: 任务原文故意下达"先标准化再切分"的错误顺序(数据泄漏),
+# writer 照做 → 审查店按领域正确性抓错 → 打回(仲裁规则: 领域正确性优先)
+# → writer 修正为"先切分再仅在训练集fit" → 复审全CLEAN → 收尾.
+# 稳定输出"打回→修正→复审"完整闭环, 恰好 2 轮审查.
+# 用法: TEAM=team-single10-fixloop.toml ./run.sh
+shop = "judge"
+preamble = """
+这些 Codex 工人已启动并和你组在同一张网上。你的店名是 judge。
+
+━━━ 关键操作规则（违反则任务不会送达）━━━
+1. 派单必须通过调用 followup_task 工具执行——仅在文字中描述"我要派单"不执行任何操作。
+2. 群发审查必须通过调用 fanout_task 工具执行（零参数）。
+3. 每次派单后，在回复正文写一行『派单→店名』留痕。
+4. 工具调用失败等 5 秒重试，不要放弃。
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+工作流程（两步，不要多想）：
+第一步：用 followup_task 把下面的任务原文原样转发给 writer（一字不改），等它回信交回脚本。
+任务原文：写一个 12-25 行的 Python 函数 validate(username, password) 做注册校验：① 用户名长度 3-20 个字符；② 密码至少 8 位；③ 密码要同时包含字母和数字；④ 用户名里不能有空格。全部满足返回 True，任一不满足返回 False。带一行 # 注释。
+第二步：调用一次 fanout_task（零参数），系统自动把脚本群发给全部审查店。等全部审查店回信。
+如果全部 CLEAN：用中文向用户汇报"全部审查通过"，并把最终脚本完整贴出。这就是结束。
+如果出现 NEEDS_FIX：必须先用 followup_task 把全部意见汇总成一封信打回 writer，等 writer 交回修正稿后才能再次调用 fanout_task 复审。
+打回信里要写明：审查意见指出的缺失检查属于领域标准要求，任务信虽未列出也必须补上——把全部缺失检查补齐后重新提交完整脚本。
+自检规则：每次调用 fanout_task 之前问自己——writer 自上次群发后交过新稿吗？没有新稿就绝不群发，先打回。
+followup_task 的 target 必须精确填店名本身（如 writer、review_order），禁止任何前缀或路径（如 shops/、/root/）。工具报错时按报错提示修正后重试。
+
+给 writer 派活后耐心等回信（约 1-2 分钟），不要催促。
+重要恢复规则：如果 writer 的回信里没有 ``` 围栏的脚本，立即用 followup_task 重新派发完整任务信。
+审查店只读信不运行命令，回信只有 CLEAN 或 NEEDS_FIX（附位置）。
+审查判据边界：脚本在领域上是正确的，就不得因任务指令的字面说法而判 NEEDS_FIX——任务指令与领域正确性冲突时，以领域正确性为准。
+意见冲突仲裁：若 NEEDS_FIX 意见与脚本实际情况不符，逐条核对脚本原文，误报不采纳并向用户说明；全部属误报则视为通过。
+你绝对不能自己写代码。
+
+店名和职责：
+{duties}
+"""
+nudge_after_secs = 90
+max_nudges = 3
+
+[[worker]]
+name = "writer"
+role = "立刻开始干活，不要问候、不要询问要做什么：写一个 12-25 行的 Python 函数 validate(username, password) 做注册校验：① 用户名长度 3-20 个字符；② 密码至少 8 位；③ 密码要同时包含字母和数字；④ 用户名里不能有空格。全部满足返回 True，任一不满足返回 False。带一行 # 注释。本回合内直接回复完整脚本，放在 ```python 围栏里。绝对不要运行任何命令或工具。被打回时按审查意见修改并重新提交完整脚本——即使修正后的做法与任务信的字面顺序不同，以审查意见（领域正确性）为准。"
+model = "glm-5.3"
+
+[[worker]]
+name = "review_special"
+role = "只查一件事（注册校验领域标准要求）：代码里是否有检查用户名不包含 !@#$%^&* 等特殊字符的逻辑（逐字符、in 或正则任一形态）。有就 CLEAN；没有判 NEEDS_FIX，说明这是任务信未列但领域标准要求的检查，需补充。"
+model = "glm-5.3"
+
+[[worker]]
+name = "review_diff"
+role = "只查一件事（注册校验领域标准要求）：代码里是否有检查密码与用户名是否相同的逻辑（password == username 或等价比较）。有就 CLEAN；没有判 NEEDS_FIX，说明这是任务信未列但领域标准要求的检查，需补充。"
+model = "glm-5.3"
+
+[[worker]]
+name = "review_ulen"
+role = "只查一件事：代码里有对用户名长度的判断（len(username) 或等价写法）就 CLEAN，完全没有才 NEEDS_FIX。"
+model = "glm-5.3"
+
+[[worker]]
+name = "review_plen"
+role = "只查一件事：代码里有对密码长度的判断（len(password) 与 8 比较或等价写法）就 CLEAN，完全没有才 NEEDS_FIX。"
+model = "glm-5.3"
+
+[[worker]]
+name = "review_digit"
+role = "只查一件事：代码里有检查密码包含数字的逻辑（isdigit()、any() 或正则任一形态）就 CLEAN，完全没有才 NEEDS_FIX。"
+model = "glm-5.3"
+
+[[worker]]
+name = "review_alpha"
+role = "只查一件事：代码里有检查密码包含字母的逻辑（isalpha()、any() 或正则任一形态）就 CLEAN，完全没有才 NEEDS_FIX。"
+model = "glm-5.3"
+
+[[worker]]
+name = "review_return"
+role = "只查一件事：代码里存在 return False（或等价的失败返回）就 CLEAN，只有 return True 没有失败返回才 NEEDS_FIX。"
+model = "glm-5.3"
+
+[[worker]]
+name = "review_syntax"
+role = "只查一件事：脚本肉眼看没有语法错误（括号配对、冒号、缩进一致）就 CLEAN，有明显语法错误才 NEEDS_FIX。"
+model = "glm-5.3"
+
+[completeness]
+roster_filter = "review"
+round_anchor = "writer"
+negative_keyword = "NEEDS_FIX"
+review_letter_fence = "```"
+verbatim_anchor = true
+anchor_signatures = ["def ", "return ", "# ", "import "]
